@@ -245,13 +245,17 @@ export class CippToolHandler {
         // Mailboxes
         // -----------------------------------------------------------------------
         case 'cipp_list_mailboxes': {
-          const { tenantFilter, type, identity, search } = args as {
+          const { tenantFilter, type, identity, displayName } = args as {
             tenantFilter: string;
             type?: string;
             identity?: string;
-            search?: string;
+            displayName?: string;
           };
-          result = await this.cippService.listMailboxes(tenantFilter, { type, identity, search });
+          result = await this.cippService.listMailboxes(tenantFilter, {
+            type,
+            identity,
+            displayName,
+          });
           break;
         }
 

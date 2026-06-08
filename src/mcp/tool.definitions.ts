@@ -476,12 +476,12 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
             'Exact mailbox to retrieve, by UPN, primary SMTP address, alias, or GUID. ' +
             'Returns just that one mailbox.',
         },
-        search: {
+        displayName: {
           type: 'string',
           description:
-            'Partial match across display name, alias, and email addresses ' +
-            '(Ambiguous Name Resolution). Returns all matching mailboxes — use ' +
-            'this to find a mailbox by name or partial address.',
+            "Search mailboxes by display name (fuzzy, case-insensitive substring match). " +
+            "E.g. 'smith' matches 'John Smith' and 'Smithson, Amy'. Use this to find a " +
+            'mailbox by name instead of returning the whole tenant.',
         },
       },
       required: ['tenantFilter'],

@@ -515,21 +515,25 @@ export class CippService {
    */
   async listMailboxes<T = unknown>(
     tenantFilter: string,
-    params?: { type?: string; identity?: string; search?: string }
+    params?: { type?: string; identity?: string; displayName?: string }
   ): Promise<T> {
     const query: Record<string, unknown> = { tenantFilter };
 
     // CIPP's ListMailboxes maps query params onto Exchange Online `Get-Mailbox`
-    // parameters via an allow-list (RecipientTypeDetails, Identity, Anr, ...).
+    // parameters via an allow-list (RecipientTypeDetails, Identity, Filter, ...).
     // Any param not on that list is silently ignored, so the names below must
     // match CIPP's exactly — in particular the recipient-type filter is
     // `RecipientTypeDetails`, NOT `type`.
     if (params?.type) query.RecipientTypeDetails = params.type;
     // Exact mailbox lookup by UPN / primary SMTP / alias / GUID.
     if (params?.identity) query.Identity = params.identity;
-    // Ambiguous Name Resolution: partial match across display name, alias and
-    // email addresses — the efficient way to find a mailbox without pulling all.
-    if (params?.search) query.Anr = params.search;
+    // Fuzzy display-name search: build an OPATH filter for `Get-Mailbox -Filter`
+    // doing a server-side substring match, so we never pull the whole tenant.
+    // OPATH single-quoted literals escape an embedded quote by doubling it.
+    if (params?.displayName) {
+      const value = params.displayName.replace(/'/g, "''");
+      query.Filter = `DisplayName -like '*${value}*'`;
+    }
 
     return this.request<T>('GET', 'ListMailboxes', query);
   }
