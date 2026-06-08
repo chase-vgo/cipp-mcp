@@ -457,7 +457,9 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   // -------------------------------------------------------------------------
   {
     name: 'cipp_list_mailboxes',
-    description: 'List mailboxes in a tenant',
+    description:
+      'List mailboxes in a tenant. Prefer `identity` or `search` to target a ' +
+      'specific mailbox rather than pulling the whole tenant.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -467,6 +469,19 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
           enum: ['UserMailbox', 'SharedMailbox', 'RoomMailbox', 'EquipmentMailbox'],
           description:
             'Filter mailboxes by recipient type. Omit to return all mailbox types.',
+        },
+        identity: {
+          type: 'string',
+          description:
+            'Exact mailbox to retrieve, by UPN, primary SMTP address, alias, or GUID. ' +
+            'Returns just that one mailbox.',
+        },
+        search: {
+          type: 'string',
+          description:
+            'Partial match across display name, alias, and email addresses ' +
+            '(Ambiguous Name Resolution). Returns all matching mailboxes — use ' +
+            'this to find a mailbox by name or partial address.',
         },
       },
       required: ['tenantFilter'],

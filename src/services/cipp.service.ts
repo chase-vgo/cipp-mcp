@@ -249,8 +249,12 @@ export class CippService {
    * @param params.allTenants - When `true`, returns all tenants including inactive ones.
    */
   async listTenants<T = unknown>(params?: { allTenants?: boolean }): Promise<T> {
-    return this.request<T>('POST', 'ListTenants', undefined, {
-      allTenantSelector: params?.allTenants,
+    // CIPP's ListTenants reads the "include *AllTenants entry" toggle from the
+    // query string (`$Request.Query.AllTenantSelector`), not the request body.
+    // It was previously sent in the POST body and silently ignored, so the
+    // toggle never took effect. Send it as a GET query param instead.
+    return this.request<T>('GET', 'ListTenants', {
+      AllTenantSelector: params?.allTenants ? 'true' : undefined,
     });
   }
 
@@ -511,9 +515,23 @@ export class CippService {
    */
   async listMailboxes<T = unknown>(
     tenantFilter: string,
-    params?: { type?: string }
+    params?: { type?: string; identity?: string; search?: string }
   ): Promise<T> {
-    return this.request<T>('GET', 'ListMailboxes', { tenantFilter, ...params });
+    const query: Record<string, unknown> = { tenantFilter };
+
+    // CIPP's ListMailboxes maps query params onto Exchange Online `Get-Mailbox`
+    // parameters via an allow-list (RecipientTypeDetails, Identity, Anr, ...).
+    // Any param not on that list is silently ignored, so the names below must
+    // match CIPP's exactly — in particular the recipient-type filter is
+    // `RecipientTypeDetails`, NOT `type`.
+    if (params?.type) query.RecipientTypeDetails = params.type;
+    // Exact mailbox lookup by UPN / primary SMTP / alias / GUID.
+    if (params?.identity) query.Identity = params.identity;
+    // Ambiguous Name Resolution: partial match across display name, alias and
+    // email addresses — the efficient way to find a mailbox without pulling all.
+    if (params?.search) query.Anr = params.search;
+
+    return this.request<T>('GET', 'ListMailboxes', query);
   }
 
   /**
@@ -524,9 +542,13 @@ export class CippService {
    * @param upn          - User principal name / primary SMTP address of the mailbox.
    */
   async listMailboxPermissions<T = unknown>(tenantFilter: string, upn: string): Promise<T> {
+    // CIPP's ListmailboxPermissions reads the mailbox identity from `userId`
+    // (used as Get-MailboxPermission -Identity). Sending `UserPrincipalName`
+    // left that null, so the lookup ran against a null identity and returned
+    // nothing useful — the value is the UPN, only the key name was wrong.
     return this.request<T>('GET', 'ListmailboxPermissions', {
       tenantFilter,
-      UserPrincipalName: upn,
+      userId: upn,
     });
   }
 
@@ -809,7 +831,15 @@ export class CippService {
     tenantFilter: string,
     params?: { Days?: number; Type?: string }
   ): Promise<T> {
-    return this.request<T>('GET', 'ListAuditLogs', { tenantFilter, ...params });
+    const query: Record<string, unknown> = { tenantFilter };
+    // CIPP's ListAuditLogs filters by relative time, not a `Days` param (which
+    // it ignored, always defaulting to the last 7 days). Translate Days -> the
+    // RelativeTime form CIPP parses: `(\d+)([dhm])`, e.g. 7 -> "7d".
+    if (params?.Days !== undefined) query.RelativeTime = `${params.Days}d`;
+    // NOTE: `Type` is not read by Invoke-ListAuditLogs and is silently ignored
+    // by CIPP. Left as a passthrough pending a client-side filter (see audit).
+    if (params?.Type !== undefined) query.Type = params.Type;
+    return this.request<T>('GET', 'ListAuditLogs', query);
   }
 
   /**
