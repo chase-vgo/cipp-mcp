@@ -265,6 +265,12 @@ export class CippToolHandler {
           break;
         }
 
+        case 'cipp_list_calendar_permissions': {
+          const { tenantFilter, upn } = args as { tenantFilter: string; upn: string };
+          result = await this.cippService.listCalendarPermissions(tenantFilter, upn);
+          break;
+        }
+
         case 'cipp_set_out_of_office': {
           const { tenantFilter, upn, enabled, internalMessage, externalMessage } = args as {
             tenantFilter: string;

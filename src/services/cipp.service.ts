@@ -557,6 +557,23 @@ export class CippService {
   }
 
   /**
+   * List the calendar folder permissions for a specific mailbox.
+   * Calls the `ListCalendarPermissions` Azure Function.
+   *
+   * @param tenantFilter - Tenant domain or identifier.
+   * @param upn          - User principal name / primary SMTP address of the mailbox.
+   */
+  async listCalendarPermissions<T = unknown>(tenantFilter: string, upn: string): Promise<T> {
+    // CIPP's ListCalendarPermissions reads the mailbox identity from `UserID`
+    // (used as the Get-MailboxFolderPermission anchor/Identity). Query-string
+    // matching is case-insensitive, so `userId` resolves to it correctly.
+    return this.request<T>('GET', 'ListCalendarPermissions', {
+      tenantFilter,
+      userId: upn,
+    });
+  }
+
+  /**
    * Configure an out-of-office auto-reply for a mailbox.
    * Calls the `ExecSetOoO` Azure Function.
    *

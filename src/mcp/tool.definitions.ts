@@ -503,6 +503,24 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
     },
   },
   {
+    name: 'cipp_list_calendar_permissions',
+    description:
+      "List the calendar folder permissions for a specific mailbox (who can " +
+      "view or edit that user's calendar, and at what access level).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        upn: {
+          type: 'string',
+          description:
+            'User Principal Name of the mailbox whose calendar permissions should be listed.',
+        },
+      },
+      required: ['tenantFilter', 'upn'],
+    },
+  },
+  {
     name: 'cipp_set_out_of_office',
     description:
       '⚠ HIGH-IMPACT. Configures the out-of-office / auto-reply for a mailbox, ' +
@@ -946,6 +964,7 @@ export const TOOL_CATEGORIES: Record<string, string[]> = {
   mailboxes: [
     'cipp_list_mailboxes',
     'cipp_list_mailbox_permissions',
+    'cipp_list_calendar_permissions',
     'cipp_set_out_of_office',
     'cipp_set_email_forwarding',
   ],
