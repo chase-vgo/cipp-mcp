@@ -102,7 +102,7 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
         searchValue: {
           type: 'string',
           description:
-            'Value to match against the chosen searchField. Supports partial string matching.',
+            'Value to match against the chosen searchField. Prefix match (startswith), case-insensitive.',
         },
       },
       required: ['tenantFilter'],

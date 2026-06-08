@@ -281,10 +281,28 @@ export class CippService {
     tenantFilter: string,
     params?: { searchField?: string; searchValue?: string }
   ): Promise<T> {
-    return this.request<T>('GET', 'ListUsers', {
-      tenantFilter,
-      ...params,
-    });
+    const query: Record<string, unknown> = { tenantFilter };
+
+    // CIPP's ListUsers function does not understand `searchField`/`searchValue`.
+    // It filters server-side via a single `graphFilter` query param, which it
+    // forwards to Graph as `$filter` (with ConsistencyLevel: eventual, so
+    // advanced operators like startswith are supported). Passing the old
+    // parameter names made CIPP silently ignore them and return every user, so
+    // translate the chosen field + value into an OData startswith() filter.
+    if (params?.searchField && params?.searchValue) {
+      const allowedFields = ['displayName', 'userPrincipalName', 'mail'];
+      if (!allowedFields.includes(params.searchField)) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Invalid searchField "${params.searchField}". Must be one of: ${allowedFields.join(', ')}.`
+        );
+      }
+      // OData string literals escape an embedded single quote by doubling it.
+      const value = params.searchValue.replace(/'/g, "''");
+      query.graphFilter = `startswith(${params.searchField},'${value}')`;
+    }
+
+    return this.request<T>('GET', 'ListUsers', query);
   }
 
   /**
