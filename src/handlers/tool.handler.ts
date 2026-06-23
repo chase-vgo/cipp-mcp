@@ -190,8 +190,8 @@ export class CippToolHandler {
         }
 
         case 'cipp_list_mfa_users': {
-          const { tenantFilter } = args as { tenantFilter: string };
-          result = await this.cippService.listMfaUsers(tenantFilter);
+          const { tenantFilter, user } = args as { tenantFilter: string; user: string };
+          result = await this.cippService.listMfaUsers(tenantFilter, user);
           break;
         }
 
@@ -392,12 +392,14 @@ export class CippToolHandler {
         // Alerts
         // -----------------------------------------------------------------------
         case 'cipp_list_audit_logs': {
-          const { tenantFilter, days, type } = args as {
+          const { tenantFilter, user, days, type } = args as {
             tenantFilter: string;
+            user: string;
             days?: number;
             type?: string;
           };
           result = await this.cippService.listAuditLogs(tenantFilter, {
+            User: user,
             Days: days,
             Type: type,
           });

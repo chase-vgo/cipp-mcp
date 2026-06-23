@@ -43,6 +43,57 @@ export interface DomainHealthCheck {
  */
 const DOMAIN_HEALTH_CHECK_TIMEOUT_MS = 15_000;
 
+/**
+ * Recursively test whether any string/number/boolean value within `record`
+ * contains `needle` (already lower-cased). Used for client-side filtering of
+ * CIPP list responses, since several CIPP endpoints expose no server-side
+ * filter for fields like the target user.
+ */
+function recordMatches(record: unknown, needle: string): boolean {
+  if (record === null || record === undefined) return false;
+  if (typeof record === 'string') return record.toLowerCase().includes(needle);
+  if (typeof record === 'number' || typeof record === 'boolean') {
+    return String(record).toLowerCase().includes(needle);
+  }
+  if (Array.isArray(record)) return record.some((item) => recordMatches(item, needle));
+  if (typeof record === 'object') {
+    return Object.values(record as Record<string, unknown>).some((v) => recordMatches(v, needle));
+  }
+  return false;
+}
+
+/**
+ * Filter a CIPP list response down to records matching `term` (case-insensitive
+ * substring match across all of a record's fields). Handles both bare-array
+ * responses and the common `{ Results: [...] }` / `{ value: [...] }` envelope
+ * shapes, preserving the original envelope. Empty `term` and non-list responses
+ * are returned unchanged.
+ */
+function filterListByTerm<T>(data: T, term: string | undefined): T {
+  if (!term) return data;
+  const needle = term.toLowerCase();
+  if (Array.isArray(data)) {
+    return data.filter((rec) => recordMatches(rec, needle)) as unknown as T;
+  }
+  if (data && typeof data === 'object') {
+    const obj = data as Record<string, unknown>;
+    for (const key of ['Results', 'value']) {
+      if (Array.isArray(obj[key])) {
+        const filtered = (obj[key] as unknown[]).filter((rec) => recordMatches(rec, needle));
+        const next: Record<string, unknown> = { ...obj, [key]: filtered };
+        // Keep the CIPP `Metadata.Count` envelope field consistent with the
+        // filtered result set rather than reporting the pre-filter total.
+        const meta = next.Metadata;
+        if (meta && typeof meta === 'object' && typeof (meta as Record<string, unknown>).Count === 'number') {
+          next.Metadata = { ...(meta as Record<string, unknown>), Count: filtered.length };
+        }
+        return next as T;
+      }
+    }
+  }
+  return data;
+}
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -459,13 +510,16 @@ export class CippService {
   }
 
   /**
-   * List MFA registration status for all users in a tenant.
-   * Calls the `ListMFAUsers` Azure Function.
+   * List MFA registration status for users in a tenant, filtered to a single
+   * user. Calls the `ListMFAUsers` Azure Function, which has no server-side
+   * user filter, so the returned list is filtered client-side.
    *
    * @param tenantFilter - Tenant domain or identifier.
+   * @param user         - User to match (UPN, display name, etc.); case-insensitive substring.
    */
-  async listMfaUsers<T = unknown>(tenantFilter: string): Promise<T> {
-    return this.request<T>('GET', 'ListMFAUsers', { tenantFilter });
+  async listMfaUsers<T = unknown>(tenantFilter: string, user: string): Promise<T> {
+    const result = await this.request<T>('GET', 'ListMFAUsers', { tenantFilter });
+    return filterListByTerm(result, user);
   }
 
   // -------------------------------------------------------------------------
@@ -840,27 +894,29 @@ export class CippService {
   // -------------------------------------------------------------------------
 
   /**
-   * List audit log entries for a tenant, optionally filtered by date and type.
-   * Calls the `ListAuditLogs` Azure Function.
+   * List audit log entries for a tenant, filtered to a single user and
+   * optionally by date and type. Calls the `ListAuditLogs` Azure Function;
+   * `User` and `Type` have no server-side support and are filtered client-side.
    *
    * @param tenantFilter - Tenant domain or identifier.
-   * @param params       - Optional filter parameters.
+   * @param params       - Filter parameters.
+   * @param params.User  - User to match (case-insensitive substring); filtered client-side.
    * @param params.Days  - Number of past days to include in the results.
-   * @param params.Type  - Audit log category to filter by (e.g. `"AzureActiveDirectory"`).
+   * @param params.Type  - Audit log category to filter by (e.g. `"AzureActiveDirectory"`); filtered client-side.
    */
   async listAuditLogs<T = unknown>(
     tenantFilter: string,
-    params?: { Days?: number; Type?: string }
+    params?: { User?: string; Days?: number; Type?: string }
   ): Promise<T> {
     const query: Record<string, unknown> = { tenantFilter };
     // CIPP's ListAuditLogs filters by relative time, not a `Days` param (which
     // it ignored, always defaulting to the last 7 days). Translate Days -> the
     // RelativeTime form CIPP parses: `(\d+)([dhm])`, e.g. 7 -> "7d".
     if (params?.Days !== undefined) query.RelativeTime = `${params.Days}d`;
-    // NOTE: `Type` is not read by Invoke-ListAuditLogs and is silently ignored
-    // by CIPP. Left as a passthrough pending a client-side filter (see audit).
-    if (params?.Type !== undefined) query.Type = params.Type;
-    return this.request<T>('GET', 'ListAuditLogs', query);
+    const result = await this.request<T>('GET', 'ListAuditLogs', query);
+    // Neither `User` nor `Type` is read by Invoke-ListAuditLogs (CIPP silently
+    // ignores them), so both are applied client-side against the returned list.
+    return filterListByTerm(filterListByTerm(result, params?.User), params?.Type);
   }
 
   /**

@@ -46,6 +46,12 @@ const USER_ID_PROP = {
     "The target user's Azure AD object ID or User Principal Name (UPN, e.g. alice@contoso.com).",
 };
 
+const USER_FILTER_PROP = {
+  type: 'string',
+  description:
+    "User to filter results to. Case-insensitive substring match against each record's fields (e.g. UPN, display name). The CIPP API has no server-side user filter for this endpoint, so matching is applied client-side after the full list is retrieved.",
+};
+
 // ---------------------------------------------------------------------------
 // Tool Definitions
 // ---------------------------------------------------------------------------
@@ -354,13 +360,14 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   },
   {
     name: 'cipp_list_mfa_users',
-    description: 'List users and their MFA status in a tenant',
+    description: 'List users and their MFA status in a tenant, filtered to a specific user',
     inputSchema: {
       type: 'object',
       properties: {
         tenantFilter: TENANT_FILTER_PROP,
+        user: USER_FILTER_PROP,
       },
-      required: ['tenantFilter'],
+      required: ['tenantFilter', 'user'],
     },
   },
   {
@@ -807,11 +814,12 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   // -------------------------------------------------------------------------
   {
     name: 'cipp_list_audit_logs',
-    description: 'List audit log entries for a tenant',
+    description: 'List audit log entries for a tenant, filtered to a specific user',
     inputSchema: {
       type: 'object',
       properties: {
         tenantFilter: TENANT_FILTER_PROP,
+        user: USER_FILTER_PROP,
         days: {
           type: 'number',
           description:
@@ -820,10 +828,10 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
         type: {
           type: 'string',
           description:
-            'Filter results to a specific log type (e.g. "AzureActiveDirectory", "Exchange", "SharePoint").',
+            'Filter results to a specific log type (e.g. "AzureActiveDirectory", "Exchange", "SharePoint"). Applied client-side, as the CIPP API ignores this parameter.',
         },
       },
-      required: ['tenantFilter'],
+      required: ['tenantFilter', 'user'],
     },
   },
   {
