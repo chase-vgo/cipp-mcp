@@ -24,6 +24,7 @@ import {
   formatObject,
   getPath,
   mapList,
+  stripHtml,
   unwrapList,
 } from '../utils/format.js';
 
@@ -51,7 +52,12 @@ const USER_DROP_KEYS = [
   'inviteTicket',
   'employeeOrgData',
   'passwordProfile',
+  '@odata.context',
+  'proxyAddresses',
 ];
+
+/** Keys of ListUserMailboxDetails that duplicate the summary fields in bulk. */
+const MAILBOX_DETAILS_DROP_KEYS = ['Mailbox', 'MailboxActionsData'];
 
 const GROUP_MEMBER_COLUMNS = ['displayName', 'userPrincipalName', 'mail', 'id', '@odata.type'];
 
@@ -133,6 +139,21 @@ export class CippToolHandler {
     return typeof v === 'number' ? v : undefined;
   }
 
+  /**
+   * CIPP's ListUserSigninLogs filters Graph on `userId eq '<guid>'`, so a UPN
+   * must be resolved to the object ID first. GUIDs pass through untouched.
+   */
+  private async resolveUserObjectId(tenant: string, userId: string): Promise<string> {
+    if (!userId.includes('@')) return userId;
+    const data = await this.cippService.listUsers(tenant, { userId });
+    const rows = unwrapList(data) ?? (data ? [data] : []);
+    const id = rows.length > 0 ? getPath(rows[0], 'id') : undefined;
+    if (typeof id !== 'string' || id.length === 0) {
+      throw new McpError(ErrorCode.InvalidParams, `Could not resolve user "${userId}" to an object ID in ${tenant}.`);
+    }
+    return id;
+  }
+
   // -------------------------------------------------------------------------
   // Dispatch
   // -------------------------------------------------------------------------
@@ -211,12 +232,10 @@ export class CippToolHandler {
       case 'cipp_list_user_devices':
         return this.list(await svc.listUserDevices(tenant, this.str(a, 'userId') as string), def, out);
 
-      case 'cipp_list_user_signin_logs':
-        return this.list(
-          await svc.listUserSigninLogs(tenant, this.str(a, 'userId') as string, this.num(a, 'top') ?? 25),
-          def,
-          out
-        );
+      case 'cipp_list_user_signin_logs': {
+        const objectId = await this.resolveUserObjectId(tenant, this.str(a, 'userId') as string);
+        return this.list(await svc.listUserSigninLogs(tenant, objectId, this.num(a, 'top') ?? 25), def, out);
+      }
 
       case 'cipp_list_signins': {
         let data = await svc.listSignIns(tenant, {
@@ -328,8 +347,12 @@ export class CippToolHandler {
           out
         );
 
-      case 'cipp_get_user_mailbox_details':
-        return this.object(await svc.getUserMailboxDetails(tenant, this.str(a, 'userId') as string));
+      case 'cipp_get_user_mailbox_details': {
+        const data = await svc.getUserMailboxDetails(tenant, this.str(a, 'userId') as string);
+        const rows = unwrapList(data);
+        const record = rows ? rows[0] : data;
+        return this.object(record, this.bool(a, 'full') ? [] : MAILBOX_DETAILS_DROP_KEYS);
+      }
 
       case 'cipp_list_mailbox_permissions':
         return this.list(await svc.listMailboxPermissions(tenant, this.str(a, 'upn') as string), def, out);
@@ -348,8 +371,17 @@ export class CippToolHandler {
         return this.list(data, def, out);
       }
 
-      case 'cipp_get_out_of_office':
-        return this.object(await svc.getOutOfOffice(tenant, this.str(a, 'userId') as string));
+      case 'cipp_get_out_of_office': {
+        const data = await svc.getOutOfOffice(tenant, this.str(a, 'userId') as string);
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+          const copy = { ...(data as Record<string, unknown>) };
+          for (const key of ['InternalMessage', 'ExternalMessage', 'DeclineMeetingMessage']) {
+            if (key in copy) copy[key] = stripHtml(copy[key]);
+          }
+          return this.object(copy);
+        }
+        return this.object(data);
+      }
 
       case 'cipp_message_trace': {
         let data = await svc.messageTrace(tenant, {

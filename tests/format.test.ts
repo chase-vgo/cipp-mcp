@@ -11,6 +11,7 @@ import {
   getPath,
   mapList,
   resolveColumns,
+  stripHtml,
   toCsv,
   unwrapList,
 } from '../src/utils/format.js';
@@ -126,5 +127,27 @@ describe('client-side filters', () => {
     expect(filterList([1, 2, 3], (v) => (v as number) > 1)).toEqual([2, 3]);
     expect(mapList({ value: [1, 2] }, (v) => (v as number) * 2)).toEqual({ value: [2, 4] });
     expect(mapList('x', (v) => v)).toBe('x');
+  });
+});
+
+describe('envelope and rich-text edge cases', () => {
+  it('unwrapList turns a single-object Results envelope into a one-row list', () => {
+    expect(unwrapList({ Results: { Identity: 'x' } })).toEqual([{ Identity: 'x' }]);
+  });
+
+  it('formatList drops empty rows and falls back to JSON when no column resolves', () => {
+    expect(formatList([{}], ['a'])).toBe('# no rows');
+    expect(formatList([1, 2], ['a'])).toBe('[1,2]');
+  });
+
+  it('resolveColumns dedupes case-variant duplicates and cellValue trims', () => {
+    expect(resolveColumns([{ Status: 'ok' }], ['Status', 'status'])).toEqual(['Status']);
+    expect(cellValue('All\n')).toBe('All');
+  });
+
+  it('stripHtml turns an Outlook auto-reply body into plain text', () => {
+    const html = '﻿<html><head><style>p{}</style></head><body><p>Out of&nbsp;office.</p><p>Back <b>Monday</b>.</p></body></html>';
+    expect(stripHtml(html)).toBe('Out of office.\nBack Monday.');
+    expect(stripHtml(42)).toBe(42);
   });
 });

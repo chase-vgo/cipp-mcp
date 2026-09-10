@@ -278,7 +278,7 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   listTool({
     name: 'cipp_list_user_signin_logs',
     description:
-      "One user's recent sign-ins (time, app, IP, location, result, client, CA status). top defaults to 25.",
+      "One user's recent sign-ins (time, app, IP, location, result, client, CA status). Accepts a UPN or object ID (a UPN is resolved first). top defaults to 25.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -503,10 +503,14 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   objectTool({
     name: 'cipp_get_user_mailbox_details',
     description:
-      'Detailed Exchange properties for one mailbox: size and quotas, archive, forwarding, litigation hold, protocols (POP/IMAP/EWS/ActiveSync), retention. Compact JSON.',
+      'Detailed Exchange properties for one mailbox: size and quotas, archive, forwarding, litigation hold, protocols (POP/IMAP/EWS/ActiveSync), retention. Compact JSON; the raw Get-Mailbox object is omitted unless full=true.',
     inputSchema: {
       type: 'object',
-      properties: { tenantFilter: TENANT_FILTER_PROP, userId: USER_ID_PROP },
+      properties: {
+        tenantFilter: TENANT_FILTER_PROP,
+        userId: USER_ID_PROP,
+        full: { type: 'boolean', description: 'Include the raw Get-Mailbox object (large).' },
+      },
       required: ['tenantFilter', 'userId'],
     },
     rules: { rejectAllTenants: ['tenantFilter'] },
@@ -587,7 +591,7 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   }),
   objectTool({
     name: 'cipp_get_out_of_office',
-    description: 'Current automatic-reply (out of office) configuration for a mailbox. Compact JSON.',
+    description: 'Current automatic-reply (out of office) state, schedule and messages for a mailbox (messages returned as plain text). Compact JSON.',
     inputSchema: {
       type: 'object',
       properties: { tenantFilter: TENANT_FILTER_PROP, userId: USER_ID_PROP },
@@ -616,24 +620,7 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
       required: ['tenantFilter'],
     },
     rules: { oneOf: [['sender'], ['recipient'], ['messageId']], rejectAllTenants: ['tenantFilter'] },
-    columns: [
-      'Received',
-      'receivedDateTime',
-      'SenderAddress',
-      'senderAddress',
-      'RecipientAddress',
-      'recipientAddress',
-      'Subject',
-      'subject',
-      'Status',
-      'status',
-      'Size',
-      'size',
-      'FromIP',
-      'fromIP',
-      'MessageId',
-      'messageId',
-    ],
+    columns: ['Received', 'SenderAddress', 'RecipientAddress', 'Subject', 'Status', 'Size', 'FromIP', 'MessageId'],
   }),
 
   // -------------------------------------------------------------------------
@@ -738,7 +725,7 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
       properties: { tenantFilter: TENANT_FILTER_PROP },
       required: ['tenantFilter'],
     },
-    columns: ['tenantFilter', 'Tenant', 'currentScore', 'maxScore', 'percentage', 'percentageVsAllTenants', 'createdDateTime'],
+    columns: ['Tenant', 'TenantName', 'CurrentScore', 'MaxScore', 'PercentageScore', 'CapturedAt'],
   }),
 
   // -------------------------------------------------------------------------
@@ -903,7 +890,7 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
       properties: { tenantFilter: TENANT_FILTER_PROP },
       required: ['tenantFilter'],
     },
-    columns: ['TenantName', 'service', 'status', 'classification', 'title', 'id', 'lastModifiedDateTime'],
+    columns: ['TenantName', 'service', 'type', 'issueId', 'desc', 'status', 'title', 'lastModifiedDateTime'],
   }),
   listTool({
     name: 'cipp_list_logs',
@@ -930,7 +917,7 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
     name: 'cipp_list_gdap_roles',
     description: 'GDAP role to security-group mappings configured in CIPP.',
     inputSchema: { type: 'object', properties: {} },
-    columns: ['RoleName', 'GroupName', 'GroupId', 'roleDefinitionId'],
+    columns: ['RoleName', 'GroupName'],
   }),
   listTool({
     name: 'cipp_list_gdap_invites',

@@ -46,9 +46,39 @@ export function unwrapList(data: unknown): unknown[] | undefined {
     const obj = data as Record<string, unknown>;
     for (const key of ['Results', 'value']) {
       if (Array.isArray(obj[key])) return obj[key] as unknown[];
+      if (obj[key] && typeof obj[key] === 'object') return [obj[key]];
     }
   }
   return undefined;
+}
+
+/** True for null/undefined, empty objects and empty arrays: rows that carry no information. */
+export function isEmptyRecord(row: unknown): boolean {
+  if (row === null || row === undefined) return true;
+  if (Array.isArray(row)) return row.length === 0;
+  if (typeof row === 'object') return Object.keys(row as Record<string, unknown>).length === 0;
+  return false;
+}
+
+/** Remove HTML tags and collapse whitespace; used for auto-reply bodies and similar rich-text fields. */
+export function stripHtml(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  return value
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<br\s*\/?>|<\/p>|<\/div>|<\/li>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\uFEFF/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/ +([.,;:!?])/g, '$1')
+    .replace(/\s*\n\s*/g, '\n')
+    .trim();
 }
 
 /**
@@ -83,7 +113,7 @@ export function getPath(record: unknown, path: string): unknown {
 /** Render one cell: scalars verbatim, scalar arrays joined with `;`, anything nested as compact JSON. */
 export function cellValue(value: unknown): string {
   if (value === null || value === undefined) return '';
-  if (typeof value === 'string') return value;
+  if (typeof value === 'string') return value.trim();
   if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
     return String(value);
   }
@@ -103,8 +133,8 @@ export function cellValue(value: unknown): string {
  * empty ones. If nothing matches, fall back to the first row's scalar keys.
  */
 export function resolveColumns(rows: unknown[], defaults: string[], fields?: string[]): string[] {
-  if (fields && fields.length > 0) return fields;
-  const present = defaults.filter((col) =>
+  if (fields && fields.length > 0) return dedupeColumns(fields);
+  const present = dedupeColumns(defaults).filter((col) =>
     rows.some((row) => {
       const v = getPath(row, col);
       return v !== undefined && v !== null && v !== '';
@@ -119,6 +149,17 @@ export function resolveColumns(rows: unknown[], defaults: string[], fields?: str
     .filter(([, v]) => v === null || typeof v !== 'object')
     .map(([k]) => k)
     .slice(0, AUTO_COLUMN_CAP);
+}
+
+/** Drop columns that differ only by case (lookup is case-insensitive, so they would duplicate). */
+function dedupeColumns(columns: string[]): string[] {
+  const seen = new Set<string>();
+  return columns.filter((c) => {
+    const key = c.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +217,9 @@ export function capSize(text: string, maxBytes: number = MAX_RESPONSE_BYTES, tot
  * truncation footer when rows were dropped, and enforces the byte cap.
  */
 export function formatList(data: unknown, defaultColumns: string[], opts: ListOutputOptions = {}): string {
-  const rows = unwrapList(data) ?? (data === null || data === undefined ? [] : [data]);
+  const rows = (unwrapList(data) ?? (data === null || data === undefined ? [] : [data])).filter(
+    (r) => !isEmptyRecord(r)
+  );
   const total = rows.length;
   if (total === 0) return '# no rows';
 
@@ -198,7 +241,8 @@ export function formatList(data: unknown, defaultColumns: string[], opts: ListOu
     body = JSON.stringify(projected);
   } else {
     const columns = resolveColumns(shown, defaultColumns, opts.fields);
-    body = toCsv(shown, columns);
+    // Nothing tabular to project (e.g. scalar rows): fall back to compact JSON.
+    body = columns.length === 0 ? JSON.stringify(shown) : toCsv(shown, columns);
   }
   return capSize(body + footer, MAX_RESPONSE_BYTES, total);
 }
