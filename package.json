@@ -1,7 +1,7 @@
 {
   "name": "cipp-mcp",
-  "version": "0.1.0",
-  "description": "MCP server for CIPP (CyberDrain Improved Partner Portal) — M365 multi-tenant management, users, security, and standards for MSPs",
+  "version": "1.0.0",
+  "description": "Read-only MCP server for CIPP (CyberDrain Improved Partner Portal) — token-efficient M365 multi-tenant reporting for MSPs",
   "main": "dist/entry.js",
   "bin": {
     "cipp-mcp": "./dist/entry.js"
@@ -18,7 +18,8 @@
     "clean": "rm -rf dist",
     "prepare": "npm run build",
     "prebuild": "npm run clean",
-    "pretest": "npm run build"
+    "pretest": "npm run build",
+    "lint:tools": "node scripts/lint-tool-definitions.mjs"
   },
   "keywords": [
     "mcp",

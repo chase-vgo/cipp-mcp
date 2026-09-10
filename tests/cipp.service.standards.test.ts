@@ -1,4 +1,4 @@
-// Tests for CippService Standards Template tooling.
+// Tests for CippService Standards read tooling.
 import { CippService } from '../src/services/cipp.service.js';
 import { Logger } from '../src/utils/logger.js';
 
@@ -14,25 +14,27 @@ function jsonResponse(payload: unknown): Response {
   } as unknown as Response;
 }
 
-describe('CippService standards template tooling', () => {
+function mockFetch(payload: unknown) {
+  const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(() =>
+    Promise.resolve(jsonResponse(payload))
+  );
+  global.fetch = fetchMock as unknown as typeof fetch;
+  return fetchMock;
+}
+
+describe('CippService standards read tooling', () => {
   let svc: CippService;
 
   beforeEach(() => {
-    svc = new CippService(
-      { cipp: { baseUrl: 'https://cipp.example', apiKey: 'test-key' } },
-      logger
-    );
+    svc = new CippService({ cipp: { baseUrl: 'https://cipp.example', apiKey: 'test-key' } }, logger);
   });
 
   afterEach(() => {
     jest.restoreAllMocks();
   });
 
-  it('listStandardTemplates issues a GET to listStandardTemplates', async () => {
-    const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(
-      () => Promise.resolve(jsonResponse([{ GUID: 't1' }]))
-    );
-    global.fetch = fetchMock as unknown as typeof fetch;
+  it('listStandardTemplates issues a GET to listStandardTemplates (lowercase l)', async () => {
+    const fetchMock = mockFetch([{ GUID: 't1' }]);
 
     const result = await svc.listStandardTemplates();
 
@@ -42,123 +44,46 @@ describe('CippService standards template tooling', () => {
     expect(init.method).toBe('GET');
   });
 
+  it('listStandardTemplates passes a template id as `id`', async () => {
+    const fetchMock = mockFetch([{ GUID: 't1' }]);
+    await svc.listStandardTemplates('t1');
+    expect(new URL(fetchMock.mock.calls[0][0]).searchParams.get('id')).toBe('t1');
+  });
+
   it('getTenantDrift GETs ListTenantDrift scoped to a tenant when given one', async () => {
-    const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(
-      () => Promise.resolve(jsonResponse([]))
-    );
-    global.fetch = fetchMock as unknown as typeof fetch;
-
+    const fetchMock = mockFetch([]);
     await svc.getTenantDrift('contoso.com');
-
-    const [url] = fetchMock.mock.calls[0];
-    const parsed = new URL(url);
+    const parsed = new URL(fetchMock.mock.calls[0][0]);
     expect(parsed.pathname).toMatch(/\/api\/ListTenantDrift$/);
     expect(parsed.searchParams.get('tenantFilter')).toBe('contoso.com');
   });
 
   it('getTenantDrift omits tenantFilter when no tenant is given', async () => {
-    const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(
-      () => Promise.resolve(jsonResponse([]))
-    );
-    global.fetch = fetchMock as unknown as typeof fetch;
-
+    const fetchMock = mockFetch([]);
     await svc.getTenantDrift();
-
-    const [url] = fetchMock.mock.calls[0];
-    const parsed = new URL(url);
+    const parsed = new URL(fetchMock.mock.calls[0][0]);
     expect(parsed.pathname).toMatch(/\/api\/ListTenantDrift$/);
     expect(parsed.searchParams.has('tenantFilter')).toBe(false);
   });
 
-  it('getTenantAlignment GETs ListTenantAlignment scoped to a tenant when given one', async () => {
-    const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(
-      () => Promise.resolve(jsonResponse([]))
-    );
-    global.fetch = fetchMock as unknown as typeof fetch;
-
-    await svc.getTenantAlignment('contoso.com');
-
-    const [url] = fetchMock.mock.calls[0];
-    const parsed = new URL(url);
-    expect(parsed.pathname).toMatch(/\/api\/ListTenantAlignment$/);
-    expect(parsed.searchParams.get('tenantFilter')).toBe('contoso.com');
-  });
-
-  it('getTenantAlignment omits tenantFilter when no tenant is given', async () => {
-    const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(
-      () => Promise.resolve(jsonResponse([]))
-    );
-    global.fetch = fetchMock as unknown as typeof fetch;
-
-    await svc.getTenantAlignment();
-
-    const [url] = fetchMock.mock.calls[0];
-    const parsed = new URL(url);
+  it('getTenantAlignment never sends tenantFilter (CIPP ignores it) and passes summary', async () => {
+    const fetchMock = mockFetch([]);
+    await svc.getTenantAlignment(false);
+    let parsed = new URL(fetchMock.mock.calls[0][0]);
     expect(parsed.pathname).toMatch(/\/api\/ListTenantAlignment$/);
     expect(parsed.searchParams.has('tenantFilter')).toBe(false);
+    expect(parsed.searchParams.has('summary')).toBe(false);
+
+    await svc.getTenantAlignment(true);
+    parsed = new URL(fetchMock.mock.calls[1][0]);
+    expect(parsed.searchParams.get('summary')).toBe('true');
   });
 
-  it('createStandardTemplate POSTs the template body to AddStandardsTemplate intact', async () => {
-    const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(
-      () => Promise.resolve(jsonResponse({ Results: 'ok' }))
-    );
-    global.fetch = fetchMock as unknown as typeof fetch;
-
-    const template = {
-      templateName: 'WYRE Baseline',
-      tenantFilter: [{ value: 'AllTenants' }],
-      standards: { someStandard: {} },
-    };
-    await svc.createStandardTemplate(template);
-
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(new URL(url).pathname).toMatch(/\/api\/AddStandardsTemplate$/);
-    expect(init.method).toBe('POST');
-    expect(JSON.parse(init.body as string)).toEqual(template);
-  });
-
-  it('createStandardTemplate rejects a template missing tenantFilter without calling CIPP', async () => {
-    const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(
-      () => Promise.resolve(jsonResponse({}))
-    );
-    global.fetch = fetchMock as unknown as typeof fetch;
-
-    await expect(
-      svc.createStandardTemplate({ templateName: 'no assignment' })
-    ).rejects.toThrow(/must include a "tenantFilter"/);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    ['null', null],
-    ['an array', []],
-    ['a primitive string', 'bad-input'],
-  ] as const)(
-    'createStandardTemplate rejects a non-object template (%s)',
-    async (_label, badInput) => {
-      const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(
-        () => Promise.resolve(jsonResponse({}))
-      );
-      global.fetch = fetchMock as unknown as typeof fetch;
-
-      await expect(
-        svc.createStandardTemplate(badInput as unknown as Record<string, unknown>)
-      ).rejects.toThrow(/JSON object/);
-      expect(fetchMock).not.toHaveBeenCalled();
-    }
-  );
-
-  it('deleteStandardTemplate POSTs RemoveStandardTemplate with the template ID', async () => {
-    const fetchMock = jest.fn<Promise<Response>, [string, RequestInit]>(
-      () => Promise.resolve(jsonResponse({ Results: 'deleted' }))
-    );
-    global.fetch = fetchMock as unknown as typeof fetch;
-
-    await svc.deleteStandardTemplate('guid-123');
-
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(new URL(url).pathname).toMatch(/\/api\/RemoveStandardTemplate$/);
-    expect(init.method).toBe('POST');
-    expect(JSON.parse(init.body as string)).toEqual({ ID: 'guid-123' });
+  it('listStandards sends ShowConsolidated only when requested', async () => {
+    const fetchMock = mockFetch([]);
+    await svc.listStandards('contoso.com');
+    expect(new URL(fetchMock.mock.calls[0][0]).searchParams.has('ShowConsolidated')).toBe(false);
+    await svc.listStandards('contoso.com', true);
+    expect(new URL(fetchMock.mock.calls[1][0]).searchParams.get('ShowConsolidated')).toBe('true');
   });
 });

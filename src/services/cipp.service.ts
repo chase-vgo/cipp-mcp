@@ -2,6 +2,12 @@
 // Wraps all HTTP calls to the CIPP Azure Function App.
 // All endpoints live at {baseUrl}/api/{FunctionName} and are authenticated
 // with a Bearer token supplied in the Authorization header.
+//
+// This service is READ-ONLY: every method maps to a CIPP List*/Get* function
+// (or ExecBECCheck, which only reads). Parameter names are verified against
+// the CIPP-API source (`Invoke-<Name>.ps1`) because CIPP silently ignores
+// query/body keys it does not read. Function-name casing in the path is
+// load-bearing (e.g. `ListmailboxPermissions`, `listStandardTemplates`).
 
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { Logger } from '../utils/logger.js';
@@ -12,7 +18,7 @@ import { TokenProvider } from './token.service.js';
 // ---------------------------------------------------------------------------
 
 /** Supported HTTP methods for the internal request helper. */
-type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE';
+type HttpMethod = 'GET' | 'POST';
 
 /** Shape of the config slice consumed by {@link CippService}. */
 interface CippServiceConfig {
@@ -38,60 +44,19 @@ export interface DomainHealthCheck {
 /**
  * Per-check timeout (ms) for `ListDomainHealth` DNS lookups. Each check
  * resolves DNS server-side at CIPP and can be slow; bounding each one keeps
- * a single stuck lookup from hanging the whole tenant response past the
- * MCP gateway's tool-call deadline.
+ * a single stuck lookup from hanging the whole tenant response.
  */
 const DOMAIN_HEALTH_CHECK_TIMEOUT_MS = 15_000;
 
-/**
- * Recursively test whether any string/number/boolean value within `record`
- * contains `needle` (already lower-cased). Used for client-side filtering of
- * CIPP list responses, since several CIPP endpoints expose no server-side
- * filter for fields like the target user.
- */
-function recordMatches(record: unknown, needle: string): boolean {
-  if (record === null || record === undefined) return false;
-  if (typeof record === 'string') return record.toLowerCase().includes(needle);
-  if (typeof record === 'number' || typeof record === 'boolean') {
-    return String(record).toLowerCase().includes(needle);
-  }
-  if (Array.isArray(record)) return record.some((item) => recordMatches(item, needle));
-  if (typeof record === 'object') {
-    return Object.values(record as Record<string, unknown>).some((v) => recordMatches(v, needle));
-  }
-  return false;
-}
+/** BEC check polling: interval and overall budget. */
+const BEC_POLL_INTERVAL_MS = 3_000;
+const BEC_POLL_BUDGET_MS = 60_000;
 
-/**
- * Filter a CIPP list response down to records matching `term` (case-insensitive
- * substring match across all of a record's fields). Handles both bare-array
- * responses and the common `{ Results: [...] }` / `{ value: [...] }` envelope
- * shapes, preserving the original envelope. Empty `term` and non-list responses
- * are returned unchanged.
- */
-function filterListByTerm<T>(data: T, term: string | undefined): T {
-  if (!term) return data;
-  const needle = term.toLowerCase();
-  if (Array.isArray(data)) {
-    return data.filter((rec) => recordMatches(rec, needle)) as unknown as T;
-  }
-  if (data && typeof data === 'object') {
-    const obj = data as Record<string, unknown>;
-    for (const key of ['Results', 'value']) {
-      if (Array.isArray(obj[key])) {
-        const filtered = (obj[key] as unknown[]).filter((rec) => recordMatches(rec, needle));
-        const next: Record<string, unknown> = { ...obj, [key]: filtered };
-        // Keep the CIPP `Metadata.Count` envelope field consistent with the
-        // filtered result set rather than reporting the pre-filter total.
-        const meta = next.Metadata;
-        if (meta && typeof meta === 'object' && typeof (meta as Record<string, unknown>).Count === 'number') {
-          next.Metadata = { ...(meta as Record<string, unknown>), Count: filtered.length };
-        }
-        return next as T;
-      }
-    }
-  }
-  return data;
+/** Only these Exchange verbs are accepted by the raw EXO tool. */
+const EXO_READ_ONLY_CMDLET = /^(Get|Search)-[A-Za-z0-9]+$/;
+
+function isAllTenants(tenantFilter: string): boolean {
+  return tenantFilter.toLowerCase() === 'alltenants';
 }
 
 // ---------------------------------------------------------------------------
@@ -100,10 +65,6 @@ function filterListByTerm<T>(data: T, term: string | undefined): T {
 
 /**
  * HTTP client for the CIPP Azure Function App API.
- *
- * All public methods map one-to-one to CIPP Azure Function endpoints.
- * Authentication is handled transparently using the Bearer token supplied
- * at construction time.
  *
  * @example
  * ```ts
@@ -147,14 +108,9 @@ export class CippService {
   /**
    * Send an HTTP request to the CIPP API.
    *
-   * For GET requests, `params` are serialised as query-string parameters.
-   * For all other methods, `body` is serialised as JSON.
+   * For GET requests, `params` are serialised as query-string parameters
+   * (undefined/null values are skipped). For POST, `body` is serialised as JSON.
    *
-   * @param method  - HTTP verb.
-   * @param path    - CIPP Function name / path segment appended to `/api/`.
-   * @param params  - Optional query parameters (GET) or ignored for non-GET.
-   * @param body    - Optional request body (non-GET requests).
-   * @returns Parsed JSON response typed as `T`.
    * @throws {McpError} On HTTP errors or network failures.
    */
   private async request<T>(
@@ -178,9 +134,9 @@ export class CippService {
 
     const url = new URL(`${this.baseUrl}/api/${path}`);
 
-    if (method === 'GET' && params) {
+    if (params) {
       for (const [key, value] of Object.entries(params)) {
-        if (value !== undefined && value !== null) {
+        if (value !== undefined && value !== null && value !== '') {
           url.searchParams.set(key, String(value));
         }
       }
@@ -191,18 +147,13 @@ export class CippService {
       'Content-Type': 'application/json',
     };
 
-    const requestInit: RequestInit = {
-      method,
-      headers,
-    };
+    const requestInit: RequestInit = { method, headers };
 
     if (method !== 'GET' && body !== undefined) {
       requestInit.body = JSON.stringify(body);
     }
 
     if (timeoutMs !== undefined) {
-      // Aborts the fetch if the response is not received in time. The abort
-      // surfaces as a network error below, which callers can catch per request.
       requestInit.signal = AbortSignal.timeout(timeoutMs);
     }
 
@@ -242,7 +193,6 @@ export class CippService {
     const text = await response.text();
     if (text.trim() === '') {
       // Some CIPP endpoints legitimately return HTTP 200 with an empty body.
-      // Treat that as "no content" rather than crashing on a JSON parse error.
       return undefined as T;
     }
 
@@ -261,62 +211,54 @@ export class CippService {
   // Core
   // -------------------------------------------------------------------------
 
-  /**
-   * Ping the CIPP API to verify connectivity and authentication.
-   * Calls the `PublicPing` Azure Function.
-   */
+  /** Ping the CIPP API (`PublicPing`). */
   async ping<T = unknown>(): Promise<T> {
     return this.request<T>('GET', 'PublicPing');
   }
 
-  /**
-   * Retrieve the current CIPP server version.
-   * Calls the `GetVersion` Azure Function.
-   */
+  /** Current CIPP version information (`GetVersion`). */
   async getVersion<T = unknown>(): Promise<T> {
     return this.request<T>('GET', 'GetVersion');
   }
 
   /**
-   * List CIPP server logs, optionally filtered by date.
-   * Calls the `ListLogs` Azure Function.
-   *
-   * @param params - Optional filter parameters.
-   * @param params.DateFilter - ISO 8601 date string to filter log entries.
+   * CIPP platform logs (`ListLogs`). CIPP only applies the Severity / Tenant /
+   * User / API filters when `Filter=true` is sent; `Days` widens the window.
    */
-  async listLogs<T = unknown>(params?: { DateFilter?: string }): Promise<T> {
-    return this.request<T>('GET', 'ListLogs', params as Record<string, unknown>);
+  async listLogs<T = unknown>(params: {
+    severity?: string;
+    tenant?: string;
+    user?: string;
+    api?: string;
+    days?: number;
+  }): Promise<T> {
+    return this.request<T>('GET', 'ListLogs', {
+      Filter: 'true',
+      Severity: params.severity,
+      Tenant: params.tenant,
+      User: params.user,
+      API: params.api,
+      Days: params.days ?? 1,
+    });
   }
 
   // -------------------------------------------------------------------------
   // Tenants
   // -------------------------------------------------------------------------
 
-  /**
-   * List all managed tenants known to CIPP.
-   * Calls the `ListTenants` Azure Function.
-   *
-   * @param params - Optional listing options.
-   * @param params.allTenants - When `true`, returns all tenants including inactive ones.
-   */
-  async listTenants<T = unknown>(params?: { allTenants?: boolean }): Promise<T> {
-    // CIPP's ListTenants reads the "include *AllTenants entry" toggle from the
-    // query string (`$Request.Query.AllTenantSelector`), not the request body.
-    // It was previously sent in the POST body and silently ignored, so the
-    // toggle never took effect. Send it as a GET query param instead.
-    return this.request<T>('GET', 'ListTenants', {
-      AllTenantSelector: params?.allTenants ? 'true' : undefined,
-    });
+  /** All managed tenants (`ListTenants`). */
+  async listTenants<T = unknown>(): Promise<T> {
+    return this.request<T>('GET', 'ListTenants');
   }
 
-  /**
-   * Retrieve detailed information for a single tenant.
-   * Calls the `ListTenantDetails` Azure Function.
-   *
-   * @param tenantFilter - The tenant's default domain name or identifier.
-   */
+  /** Organisation profile for one tenant (`ListTenantDetails`). */
   async getTenantDetails<T = unknown>(tenantFilter: string): Promise<T> {
     return this.request<T>('GET', 'ListTenantDetails', { tenantFilter });
+  }
+
+  /** Summary user counts for a tenant (`ListUserCounts`). */
+  async userCounts<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListUserCounts', { tenantFilter });
   }
 
   // -------------------------------------------------------------------------
@@ -324,202 +266,122 @@ export class CippService {
   // -------------------------------------------------------------------------
 
   /**
-   * List users within a tenant, with optional search filtering.
-   * Calls the `ListUsers` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param params       - Optional search parameters.
-   * @param params.searchField - Azure AD attribute to search on (e.g. `displayName`).
-   * @param params.searchValue - Value to match against the search field.
+   * Users in a tenant (`ListUsers`). Either a single user via `UserID`, or a
+   * server-side prefix search translated to a Graph `$filter` via `graphFilter`.
    */
   async listUsers<T = unknown>(
     tenantFilter: string,
-    params?: { searchField?: string; searchValue?: string }
+    params: { userId?: string; searchField?: string; searchValue?: string }
   ): Promise<T> {
     const query: Record<string, unknown> = { tenantFilter };
-
-    // CIPP's ListUsers function does not understand `searchField`/`searchValue`.
-    // It filters server-side via a single `graphFilter` query param, which it
-    // forwards to Graph as `$filter` (with ConsistencyLevel: eventual, so
-    // advanced operators like startswith are supported). Passing the old
-    // parameter names made CIPP silently ignore them and return every user, so
-    // translate the chosen field + value into an OData startswith() filter.
-    if (params?.searchField && params?.searchValue) {
-      const allowedFields = ['displayName', 'userPrincipalName', 'mail'];
-      if (!allowedFields.includes(params.searchField)) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          `Invalid searchField "${params.searchField}". Must be one of: ${allowedFields.join(', ')}.`
-        );
-      }
+    if (params.userId) {
+      query.UserID = params.userId;
+    } else if (params.searchField && params.searchValue) {
       // OData string literals escape an embedded single quote by doubling it.
       const value = params.searchValue.replace(/'/g, "''");
       query.graphFilter = `startswith(${params.searchField},'${value}')`;
     }
-
     return this.request<T>('GET', 'ListUsers', query);
   }
 
-  /**
-   * Create a new user in a tenant.
-   * Calls the `AddUser` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userData     - User properties to set (displayName, UPN, password, etc.).
-   */
-  async createUser<T = unknown>(
-    tenantFilter: string,
-    userData: Record<string, unknown>
-  ): Promise<T> {
-    return this.request<T>('POST', 'AddUser', undefined, { tenantFilter, ...userData });
-  }
-
-  /**
-   * Update properties of an existing user.
-   * Calls the `EditUser` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userId       - Azure AD object ID of the user to update.
-   * @param userData     - User properties to update.
-   */
-  async editUser<T = unknown>(
-    tenantFilter: string,
-    userId: string,
-    userData: Record<string, unknown>
-  ): Promise<T> {
-    return this.request<T>('PATCH', 'EditUser', undefined, {
+  /** MFA registration status for all users in a tenant (`ListMFAUsers`). */
+  async listMfaUsers<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListMFAUsers', {
       tenantFilter,
-      id: userId,
-      ...userData,
+      UseReportDB: isAllTenants(tenantFilter) ? 'true' : undefined,
     });
   }
 
-  /**
-   * Disable a user account, preventing sign-in.
-   * Calls the `ExecDisableUser` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userId       - Azure AD object ID of the user to disable.
-   */
-  async disableUser<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
-    return this.request<T>('POST', 'ExecDisableUser', undefined, {
-      tenantFilter,
-      ID: userId,
-    });
-  }
-
-  /**
-   * Reset a user's password.
-   * Calls the `ExecResetPass` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userId       - Azure AD object ID of the user.
-   * @param newPassword  - Optional explicit password; omit to let CIPP generate one.
-   */
-  async resetPassword<T = unknown>(
-    tenantFilter: string,
-    userId: string,
-    newPassword?: string
-  ): Promise<T> {
-    return this.request<T>('POST', 'ExecResetPass', undefined, {
-      tenantFilter,
-      ID: userId,
-      ...(newPassword && { newPassword }),
-    });
-  }
-
-  /**
-   * Reset all registered MFA methods for a user.
-   * Calls the `ExecResetMFA` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userId       - Azure AD object ID of the user.
-   */
-  async resetMFA<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
-    return this.request<T>('POST', 'ExecResetMFA', undefined, {
-      tenantFilter,
-      ID: userId,
-    });
-  }
-
-  /**
-   * Revoke all active sign-in sessions for a user.
-   * Calls the `ExecRevokeSessions` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userId       - Azure AD object ID of the user.
-   */
-  async revokeSessions<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
-    return this.request<T>('POST', 'ExecRevokeSessions', undefined, {
-      tenantFilter,
-      ID: userId,
-    });
-  }
-
-  /**
-   * Offboard a user, optionally applying additional cleanup actions.
-   * Calls the `ExecOffboardUser` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userId       - Azure AD object ID of the user to offboard.
-   * @param options      - Optional offboarding actions (e.g. revokeSession, deleteUser).
-   */
-  async offboardUser<T = unknown>(
-    tenantFilter: string,
-    userId: string,
-    options?: Record<string, unknown>
-  ): Promise<T> {
-    return this.request<T>('POST', 'ExecOffboardUser', undefined, {
-      tenantFilter,
-      ID: userId,
-      ...options,
-    });
-  }
-
-  /**
-   * List devices registered to a specific user.
-   * Calls the `ListUserDevices` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userId       - Azure AD object ID of the user.
-   */
-  async listUserDevices<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
-    return this.request<T>('GET', 'ListUserDevices', { tenantFilter, userId });
-  }
-
-  /**
-   * List group memberships for a specific user.
-   * Calls the `ListUserGroups` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userId       - Azure AD object ID of the user.
-   */
+  /** Group memberships for a user (`ListUserGroups`). */
   async listUserGroups<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
     return this.request<T>('GET', 'ListUserGroups', { tenantFilter, userId });
   }
 
-  /**
-   * Run a Business Email Compromise (BEC) check for a user.
-   * Calls the `ExecBECCheck` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param userId       - Azure AD object ID of the user to check.
-   */
-  async becCheck<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
-    return this.request<T>('GET', 'ExecBECCheck', { tenantFilter, userId });
+  /** Intune devices registered to a user (`ListUserDevices`). */
+  async listUserDevices<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
+    return this.request<T>('GET', 'ListUserDevices', { tenantFilter, UserID: userId });
+  }
+
+  /** Recent sign-ins for one user (`ListUserSigninLogs`). */
+  async listUserSigninLogs<T = unknown>(tenantFilter: string, userId: string, top = 25): Promise<T> {
+    return this.request<T>('GET', 'ListUserSigninLogs', { tenantFilter, UserID: userId, top });
+  }
+
+  /** Tenant sign-in log (`ListSignIns`). */
+  async listSignIns<T = unknown>(
+    tenantFilter: string,
+    params: { days?: number; failedOnly?: boolean; filter?: string }
+  ): Promise<T> {
+    return this.request<T>('GET', 'ListSignIns', {
+      tenantFilter,
+      Days: params.days ?? 7,
+      failedLogonsOnly: params.failedOnly ? 'true' : undefined,
+      Filter: params.filter,
+    });
+  }
+
+  /** Accounts with no sign-in for N days (`ListInactiveAccounts`). */
+  async listInactiveAccounts<T = unknown>(tenantFilter: string, inactiveDays = 90): Promise<T> {
+    return this.request<T>('GET', 'ListInactiveAccounts', { tenantFilter, InactiveDays: inactiveDays });
+  }
+
+  /** Guest accounts with lifecycle status (`ListGuestUsers`). */
+  async listGuestUsers<T = unknown>(tenantFilter: string, staleDays = 90): Promise<T> {
+    return this.request<T>('GET', 'ListGuestUsers', { tenantFilter, staleDays });
+  }
+
+  /** Entra role definitions with active members (`ListRoles`). */
+  async listRoles<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListRoles', { tenantFilter });
+  }
+
+  /** Conditional Access policies applying to a user (`ListUserConditionalAccessPolicies`). */
+  async listUserConditionalAccessPolicies<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
+    return this.request<T>('GET', 'ListUserConditionalAccessPolicies', { tenantFilter, UserID: userId });
   }
 
   /**
-   * List MFA registration status for users in a tenant, filtered to a single
-   * user. Calls the `ListMFAUsers` Azure Function, which has no server-side
-   * user filter, so the returned list is filtered client-side.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param user         - User to match (UPN, display name, etc.); case-insensitive substring.
+   * Business Email Compromise assessment (`ExecBECCheck`). CIPP queues the
+   * check on first call and answers `{ GUID }` / `{ Waiting: true }`; results
+   * are fetched by polling with `GUID=<userid>`. This method polls within a
+   * fixed budget and returns whatever CIPP has at the end.
    */
-  async listMfaUsers<T = unknown>(tenantFilter: string, user: string): Promise<T> {
-    const result = await this.request<T>('GET', 'ListMFAUsers', { tenantFilter });
-    return filterListByTerm(result, user);
+  async becCheck<T = unknown>(
+    tenantFilter: string,
+    userId: string,
+    userName: string,
+    overwrite = false
+  ): Promise<T> {
+    const first = await this.request<Record<string, unknown>>('GET', 'ExecBECCheck', {
+      tenantFilter,
+      userid: userId,
+      userName,
+      overwrite: overwrite ? 'true' : undefined,
+    });
+    if (!this.becIsWaiting(first)) return first as T;
+
+    const deadline = Date.now() + BEC_POLL_BUDGET_MS;
+    let latest: Record<string, unknown> = first;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, BEC_POLL_INTERVAL_MS));
+      latest = await this.request<Record<string, unknown>>('GET', 'ExecBECCheck', {
+        tenantFilter,
+        userid: userId,
+        userName,
+        GUID: userId,
+      });
+      if (!this.becIsWaiting(latest)) return latest as T;
+    }
+    return { Waiting: true, GUID: userId, note: 'Assessment still running; call again to fetch results.' } as T;
+  }
+
+  private becIsWaiting(payload: unknown): boolean {
+    if (!payload || typeof payload !== 'object') return true;
+    const obj = payload as Record<string, unknown>;
+    if (obj.Waiting === true) return true;
+    // First call returns only the GUID it queued under.
+    const keys = Object.keys(obj);
+    return keys.length === 1 && keys[0] === 'GUID';
   }
 
   // -------------------------------------------------------------------------
@@ -527,32 +389,19 @@ export class CippService {
   // -------------------------------------------------------------------------
 
   /**
-   * List Azure AD groups in a tenant, with optional search filtering.
-   * Calls the `ListGroups` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param params       - Optional search parameters.
-   * @param params.search - Free-text search string to filter groups.
+   * Groups in a tenant (`ListGroups`). With `groupId` and `members`/`owners`
+   * the endpoint returns that group's members/owners instead of the group list.
    */
   async listGroups<T = unknown>(
     tenantFilter: string,
-    params?: { search?: string }
+    params: { groupId?: string; members?: boolean; owners?: boolean }
   ): Promise<T> {
-    return this.request<T>('GET', 'ListGroups', { tenantFilter, ...params });
-  }
-
-  /**
-   * Create a new Azure AD group in a tenant.
-   * Calls the `AddGroup` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param groupData    - Group properties (displayName, groupType, etc.).
-   */
-  async createGroup<T = unknown>(
-    tenantFilter: string,
-    groupData: Record<string, unknown>
-  ): Promise<T> {
-    return this.request<T>('POST', 'AddGroup', undefined, { tenantFilter, ...groupData });
+    return this.request<T>('GET', 'ListGroups', {
+      tenantFilter,
+      groupID: params.groupId,
+      members: params.members ? 'true' : undefined,
+      owners: params.owners && !params.members ? 'true' : undefined,
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -560,110 +409,90 @@ export class CippService {
   // -------------------------------------------------------------------------
 
   /**
-   * List Exchange Online mailboxes in a tenant.
-   * Calls the `ListMailboxes` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param params       - Optional filtering options.
-   * @param params.type  - Mailbox type filter (e.g. `"SharedMailbox"`, `"UserMailbox"`).
+   * Exchange mailboxes (`ListMailboxes`). CIPP maps query params onto
+   * `Get-Mailbox` via an allow-list: `RecipientTypeDetails`, `Identity`, `Filter`.
    */
   async listMailboxes<T = unknown>(
     tenantFilter: string,
-    params?: { type?: string; identity?: string; displayName?: string }
+    params: { type?: string; identity?: string; displayName?: string }
   ): Promise<T> {
     const query: Record<string, unknown> = { tenantFilter };
-
-    // CIPP's ListMailboxes maps query params onto Exchange Online `Get-Mailbox`
-    // parameters via an allow-list (RecipientTypeDetails, Identity, Filter, ...).
-    // Any param not on that list is silently ignored, so the names below must
-    // match CIPP's exactly — in particular the recipient-type filter is
-    // `RecipientTypeDetails`, NOT `type`.
-    if (params?.type) query.RecipientTypeDetails = params.type;
-    // Exact mailbox lookup by UPN / primary SMTP / alias / GUID.
-    if (params?.identity) query.Identity = params.identity;
-    // Fuzzy display-name search: build an OPATH filter for `Get-Mailbox -Filter`
-    // doing a server-side substring match, so we never pull the whole tenant.
-    // OPATH single-quoted literals escape an embedded quote by doubling it.
-    if (params?.displayName) {
+    if (params.type) query.RecipientTypeDetails = params.type;
+    if (params.identity) query.Identity = params.identity;
+    if (params.displayName) {
+      // OPATH single-quoted literals escape an embedded quote by doubling it.
       const value = params.displayName.replace(/'/g, "''");
       query.Filter = `DisplayName -like '*${value}*'`;
     }
-
     return this.request<T>('GET', 'ListMailboxes', query);
   }
 
-  /**
-   * List permissions granted on a specific mailbox.
-   * Calls the `ListmailboxPermissions` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param upn          - User principal name / primary SMTP address of the mailbox.
-   */
+  /** Detailed mailbox properties for one user (`ListUserMailboxDetails`). */
+  async getUserMailboxDetails<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
+    return this.request<T>('GET', 'ListUserMailboxDetails', { tenantFilter, UserID: userId });
+  }
+
+  /** Mailbox permissions (`ListmailboxPermissions`; lowercase m is load-bearing). */
   async listMailboxPermissions<T = unknown>(tenantFilter: string, upn: string): Promise<T> {
-    // CIPP's ListmailboxPermissions reads the mailbox identity from `userId`
-    // (used as Get-MailboxPermission -Identity). Sending `UserPrincipalName`
-    // left that null, so the lookup ran against a null identity and returned
-    // nothing useful — the value is the UPN, only the key name was wrong.
-    return this.request<T>('GET', 'ListmailboxPermissions', {
-      tenantFilter,
-      userId: upn,
-    });
+    return this.request<T>('GET', 'ListmailboxPermissions', { tenantFilter, userId: upn });
   }
 
-  /**
-   * List the calendar folder permissions for a specific mailbox.
-   * Calls the `ListCalendarPermissions` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param upn          - User principal name / primary SMTP address of the mailbox.
-   */
+  /** Calendar folder permissions (`ListCalendarPermissions`). */
   async listCalendarPermissions<T = unknown>(tenantFilter: string, upn: string): Promise<T> {
-    // CIPP's ListCalendarPermissions reads the mailbox identity from `UserID`
-    // (used as the Get-MailboxFolderPermission anchor/Identity). Query-string
-    // matching is case-insensitive, so `userId` resolves to it correctly.
-    return this.request<T>('GET', 'ListCalendarPermissions', {
+    return this.request<T>('GET', 'ListCalendarPermissions', { tenantFilter, UserID: upn });
+  }
+
+  /** Inbox rules on one mailbox (`ListUserMailboxRules`). */
+  async listUserMailboxRules<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
+    return this.request<T>('GET', 'ListUserMailboxRules', { tenantFilter, UserID: userId });
+  }
+
+  /** Mailboxes with forwarding configured (`ListMailboxForwarding`). */
+  async listMailboxForwarding<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListMailboxForwarding', {
       tenantFilter,
-      userId: upn,
+      UseReportDB: isAllTenants(tenantFilter) ? 'true' : undefined,
     });
   }
 
-  /**
-   * Configure an out-of-office auto-reply for a mailbox.
-   * Calls the `ExecSetOoO` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param upn          - User principal name of the mailbox owner.
-   * @param oooData      - OoO settings (enabled, internalMessage, externalMessage, etc.).
-   */
-  async setOutOfOffice<T = unknown>(
-    tenantFilter: string,
-    upn: string,
-    oooData: Record<string, unknown>
-  ): Promise<T> {
-    return this.request<T>('POST', 'ExecSetOoO', undefined, {
-      tenantFilter,
-      UserPrincipalName: upn,
-      ...oooData,
-    });
+  /** Out-of-office configuration for a mailbox (`ListOoO`). */
+  async getOutOfOffice<T = unknown>(tenantFilter: string, userId: string): Promise<T> {
+    return this.request<T>('GET', 'ListOoO', { tenantFilter, userid: userId });
   }
 
-  /**
-   * Configure email forwarding for a mailbox.
-   * Calls the `ExecEmailForward` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param upn          - User principal name of the mailbox owner.
-   * @param forwardData  - Forwarding settings (forwardTo, keepCopy, etc.).
-   */
-  async setEmailForwarding<T = unknown>(
+  /** Message trace (`ListMessageTrace`, POST body). */
+  async messageTrace<T = unknown>(
     tenantFilter: string,
-    upn: string,
-    forwardData: Record<string, unknown>
+    params: { sender?: string; recipient?: string; messageId?: string; days?: number; status?: string }
   ): Promise<T> {
-    return this.request<T>('POST', 'ExecEmailForward', undefined, {
+    const days = Math.min(Math.max(params.days ?? 2, 1), 10);
+    const body: Record<string, unknown> = { tenantFilter, days };
+    if (params.sender) body.sender = params.sender;
+    if (params.recipient) body.recipient = params.recipient;
+    if (params.messageId) body.messageId = params.messageId;
+    if (params.status) body.status = params.status;
+    return this.request<T>('POST', 'ListMessageTrace', undefined, body);
+  }
+
+  // -------------------------------------------------------------------------
+  // Devices
+  // -------------------------------------------------------------------------
+
+  /** Intune managed devices (`ListDevices`). */
+  async listDevices<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListDevices', { tenantFilter });
+  }
+
+  /** One device by ID, name or serial (`ListDeviceDetails`). */
+  async getDeviceDetails<T = unknown>(
+    tenantFilter: string,
+    params: { deviceId?: string; deviceName?: string; serial?: string }
+  ): Promise<T> {
+    return this.request<T>('GET', 'ListDeviceDetails', {
       tenantFilter,
-      UserPrincipalName: upn,
-      ...forwardData,
+      DeviceID: params.deviceId,
+      DeviceName: params.deviceName,
+      DeviceSerial: params.serial,
     });
   }
 
@@ -671,170 +500,75 @@ export class CippService {
   // Security & Conditional Access
   // -------------------------------------------------------------------------
 
-  /**
-   * List all Conditional Access policies in a tenant.
-   * Calls the `ListConditionalAccessPolicies` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   */
+  /** Conditional Access policies (`ListConditionalAccessPolicies`). */
   async listConditionalAccessPolicies<T = unknown>(tenantFilter: string): Promise<T> {
     return this.request<T>('GET', 'ListConditionalAccessPolicies', { tenantFilter });
   }
 
-  /**
-   * List all named locations defined in a tenant's Conditional Access configuration.
-   * Calls the `ListNamedLocations` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   */
+  /** Named locations (`ListNamedLocations`). */
   async listNamedLocations<T = unknown>(tenantFilter: string): Promise<T> {
     return this.request<T>('GET', 'ListNamedLocations', { tenantFilter });
+  }
+
+  /** Cached Secure Score per tenant (`ListSecureScoreReport`). */
+  async getSecureScore<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListSecureScoreReport', { tenantFilter });
   }
 
   // -------------------------------------------------------------------------
   // Standards
   // -------------------------------------------------------------------------
 
-  /**
-   * List CIPP standards (best-practice policies) configured for a tenant.
-   * Calls the `ListStandards` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   */
-  async listStandards<T = unknown>(tenantFilter: string): Promise<T> {
-    return this.request<T>('GET', 'ListStandards', { tenantFilter });
-  }
-
-  /**
-   * Trigger a standards compliance check run for a tenant.
-   * Calls the `ExecStandardsRun` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   */
-  async runStandardsCheck<T = unknown>(tenantFilter: string): Promise<T> {
-    return this.request<T>('GET', 'ExecStandardsRun', { tenantFilter });
-  }
-
-  /**
-   * List the CIPP Standards Templates configured across the partner tenant.
-   * Calls the `listStandardTemplates` Azure Function.
-   */
-  async listStandardTemplates<T = unknown>(): Promise<T> {
-    // CIPP names this function with a lowercase 'l' — do not capitalise.
-    return this.request<T>('GET', 'listStandardTemplates');
-  }
-
-  /**
-   * Report standards drift for a tenant, or for every tenant when no
-   * `tenantFilter` is given. Calls the `ListTenantDrift` Azure Function.
-   *
-   * @param tenantFilter - Optional tenant domain or identifier.
-   */
-  async getTenantDrift<T = unknown>(tenantFilter?: string): Promise<T> {
-    return this.request<T>(
-      'GET',
-      'ListTenantDrift',
-      tenantFilter ? { tenantFilter } : undefined
-    );
-  }
-
-  /**
-   * Report each tenant's alignment percentage against its assigned
-   * Standards Templates, or for every tenant when no `tenantFilter` is
-   * given. Calls the `ListTenantAlignment` Azure Function.
-   *
-   * @param tenantFilter - Optional tenant domain or identifier.
-   */
-  async getTenantAlignment<T = unknown>(tenantFilter?: string): Promise<T> {
-    return this.request<T>(
-      'GET',
-      'ListTenantAlignment',
-      tenantFilter ? { tenantFilter } : undefined
-    );
-  }
-
-  /**
-   * Create or update a CIPP Standards Template (CIPP upserts by GUID).
-   * Calls the `AddStandardsTemplate` Azure Function.
-   *
-   * The template object is passed through to CIPP unchanged — cipp-mcp
-   * does not model CIPP's template schema, which keeps this tool stable
-   * across CIPP versions. Validation is intentionally light: the object
-   * must exist and carry a `tenantFilter` assigning it to at least one
-   * tenant (CIPP itself rejects templates without one).
-   *
-   * @param template - The full Standards Template JSON object.
-   */
-  async createStandardTemplate<T = unknown>(
-    template: Record<string, unknown>
-  ): Promise<T> {
-    if (template === null || typeof template !== 'object' || Array.isArray(template)) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'Standards template must be a JSON object.'
-      );
-    }
-    if (template.tenantFilter === undefined || template.tenantFilter === null) {
-      throw new McpError(
-        ErrorCode.InvalidParams,
-        'Standards template must include a "tenantFilter" assigning it to at least one tenant.'
-      );
-    }
-    return this.request<T>('POST', 'AddStandardsTemplate', undefined, template);
-  }
-
-  /**
-   * Delete a CIPP Standards Template by ID.
-   * Calls the `RemoveStandardTemplate` Azure Function.
-   *
-   * @param templateId - The GUID of the Standards Template to delete.
-   */
-  async deleteStandardTemplate<T = unknown>(templateId: string): Promise<T> {
-    return this.request<T>('POST', 'RemoveStandardTemplate', undefined, {
-      ID: templateId,
+  /** Standards applied to a tenant (`ListStandards`). */
+  async listStandards<T = unknown>(tenantFilter: string, consolidated = false): Promise<T> {
+    return this.request<T>('GET', 'ListStandards', {
+      tenantFilter,
+      ShowConsolidated: consolidated ? 'true' : undefined,
     });
   }
 
-  /**
-   * Retrieve Best Practice Analyser (BPA) results for a tenant.
-   * Calls the `ListBPA` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   */
-  async listBPA<T = unknown>(tenantFilter: string): Promise<T> {
-    return this.request<T>('GET', 'ListBPA', { tenantFilter });
+  /** Standards Templates (`listStandardTemplates`; lowercase l is load-bearing). */
+  async listStandardTemplates<T = unknown>(templateId?: string): Promise<T> {
+    return this.request<T>('GET', 'listStandardTemplates', templateId ? { id: templateId } : undefined);
+  }
+
+  /** Standards drift (`ListTenantDrift`), optionally scoped to one tenant. */
+  async getTenantDrift<T = unknown>(tenantFilter?: string): Promise<T> {
+    return this.request<T>('GET', 'ListTenantDrift', tenantFilter ? { tenantFilter } : undefined);
   }
 
   /**
-   * List the DNS domains registered in a tenant.
-   * Calls the `ListDomains` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
+   * Tenant alignment against Standards Templates (`ListTenantAlignment`).
+   * CIPP reads only `summary` / `granular` here — it has no tenant filter —
+   * so per-tenant scoping is applied by the caller on the `tenantFilter` column.
    */
+  async getTenantAlignment<T = unknown>(summary = false): Promise<T> {
+    return this.request<T>('GET', 'ListTenantAlignment', summary ? { summary: 'true' } : undefined);
+  }
+
+  /** Cached Domain Analyser results (`ListDomainAnalyser`). */
+  async listDomainAnalyser<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListDomainAnalyser', { tenantFilter });
+  }
+
+  /** Verified domains in a tenant (`ListDomains`). */
   async listDomains<T = unknown>(tenantFilter: string): Promise<T> {
     return this.request<T>('GET', 'ListDomains', { tenantFilter });
   }
 
   /**
-   * Check DNS health (SPF, DMARC, DKIM) for every domain in a tenant.
+   * Live DNS health (SPF, DMARC, DKIM) for every domain in a tenant.
    *
-   * The CIPP `ListDomainHealth` Azure Function is a per-domain DNS helper: it
-   * requires `Action` + `Domain` query parameters and ignores `tenantFilter`.
-   * Called with only `tenantFilter` it returns HTTP 200 with an empty body.
-   * This method therefore enumerates the tenant's domains via `ListDomains`
-   * first, then runs the SPF / DMARC / DKIM checks per domain.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @returns One {@link DomainHealthCheck} per domain in the tenant.
+   * `ListDomainHealth` is a per-domain DNS helper (requires `Action` +
+   * `Domain`, ignores `tenantFilter`), so this enumerates the tenant's domains
+   * via `ListDomains` first and runs the three checks per domain.
    */
   async listDomainHealth(tenantFilter: string): Promise<DomainHealthCheck[]> {
     const domains = await this.listDomains<Array<{ id?: string }>>(tenantFilter);
     const domainNames = (Array.isArray(domains) ? domains : [])
       .map((d) => d?.id)
       .filter((id): id is string => typeof id === 'string' && id.length > 0)
-      // Skip the tenant's `.onmicrosoft.com` routing domain: it carries no
-      // real customer mail DNS, so SPF/DMARC/DKIM checks against it only
-      // ever hang or fail with no actionable result.
+      // The .onmicrosoft.com routing domain carries no customer mail DNS.
       .filter((id) => !id.toLowerCase().endsWith('.onmicrosoft.com'));
 
     return Promise.all(
@@ -849,10 +583,6 @@ export class CippService {
     );
   }
 
-  /**
-   * Run a single `ListDomainHealth` DNS check for one domain. Per-check
-   * failures are captured so one bad lookup does not sink the whole tenant.
-   */
   private async checkDomainRecord(domain: string, action: string): Promise<unknown> {
     try {
       return await this.request(
@@ -871,103 +601,143 @@ export class CippService {
   // Licenses
   // -------------------------------------------------------------------------
 
-  /**
-   * List Microsoft 365 license assignments within a tenant.
-   * Calls the `ListLicenses` Azure Function.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   */
-  async listLicenses<T = unknown>(tenantFilter: string): Promise<T> {
-    return this.request<T>('GET', 'ListLicenses', { tenantFilter });
+  /** License SKUs and counts (`ListLicenses`). */
+  async listLicenses<T = unknown>(tenantFilter: string, includeExcluded = false): Promise<T> {
+    return this.request<T>('GET', 'ListLicenses', {
+      tenantFilter,
+      IncludeExcluded: includeExcluded ? 'true' : undefined,
+    });
   }
 
-  /**
-   * List all CSP-level license subscriptions across the partner account.
-   * Calls the `ListCSPLicenses` Azure Function.
-   */
-  async listCSPLicenses<T = unknown>(): Promise<T> {
-    return this.request<T>('GET', 'ListCSPLicenses');
+  /** Detailed license overview (`ListLicensesReport`). */
+  async listLicensesReport<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListLicensesReport', { tenantFilter });
   }
 
   // -------------------------------------------------------------------------
-  // Alerts
+  // Alerts, logs & health
   // -------------------------------------------------------------------------
 
-  /**
-   * List audit log entries for a tenant, filtered to a single user and
-   * optionally by date and type. Calls the `ListAuditLogs` Azure Function;
-   * `User` and `Type` have no server-side support and are filtered client-side.
-   *
-   * @param tenantFilter - Tenant domain or identifier.
-   * @param params       - Filter parameters.
-   * @param params.User  - User to match (case-insensitive substring); filtered client-side.
-   * @param params.Days  - Number of past days to include in the results.
-   * @param params.Type  - Audit log category to filter by (e.g. `"AzureActiveDirectory"`); filtered client-side.
-   */
-  async listAuditLogs<T = unknown>(
-    tenantFilter: string,
-    params?: { User?: string; Days?: number; Type?: string }
-  ): Promise<T> {
-    const query: Record<string, unknown> = { tenantFilter };
-    // CIPP's ListAuditLogs filters by relative time, not a `Days` param (which
-    // it ignored, always defaulting to the last 7 days). Translate Days -> the
-    // RelativeTime form CIPP parses: `(\d+)([dhm])`, e.g. 7 -> "7d".
-    if (params?.Days !== undefined) query.RelativeTime = `${params.Days}d`;
-    const result = await this.request<T>('GET', 'ListAuditLogs', query);
-    // Neither `User` nor `Type` is read by Invoke-ListAuditLogs (CIPP silently
-    // ignores them), so both are applied client-side against the returned list.
-    return filterListByTerm(filterListByTerm(result, params?.User), params?.Type);
+  /** CIPP-captured audit log entries (`ListAuditLogs`); `days` becomes `RelativeTime`. */
+  async listAuditLogs<T = unknown>(tenantFilter: string, days = 7): Promise<T> {
+    return this.request<T>('GET', 'ListAuditLogs', { tenantFilter, RelativeTime: `${days}d` });
   }
 
-  /**
-   * Retrieve the current CIPP alert queue.
-   * Calls the `ListAlertsQueue` Azure Function.
-   */
+  /** Configured alert rules (`ListAlertsQueue`). */
   async listAlertQueue<T = unknown>(): Promise<T> {
     return this.request<T>('GET', 'ListAlertsQueue');
+  }
+
+  /** Active fired alert items (`ListAlertResults`). */
+  async listAlertResults<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListAlertResults', { tenantFilter });
+  }
+
+  /** Microsoft 365 service health (`ListServiceHealth`). */
+  async listServiceHealth<T = unknown>(tenantFilter: string): Promise<T> {
+    return this.request<T>('GET', 'ListServiceHealth', { tenantFilter });
   }
 
   // -------------------------------------------------------------------------
   // GDAP
   // -------------------------------------------------------------------------
 
-  /**
-   * List available Granular Delegated Admin Privileges (GDAP) roles.
-   * Calls the `ListGDAPRoles` Azure Function.
-   */
+  /** GDAP role mappings (`ListGDAPRoles`). */
   async listGDAPRoles<T = unknown>(): Promise<T> {
     return this.request<T>('GET', 'ListGDAPRoles');
   }
 
-  /**
-   * List pending and accepted GDAP relationship invitations.
-   * Calls the `ListGDAPInvite` Azure Function.
-   */
+  /** GDAP invites (`ListGDAPInvite`). */
   async listGDAPInvites<T = unknown>(): Promise<T> {
     return this.request<T>('GET', 'ListGDAPInvite');
+  }
+
+  /** GDAP relationships (`ListGDAPRelationships`). */
+  async listGDAPRelationships<T = unknown>(): Promise<T> {
+    return this.request<T>('GET', 'ListGDAPRelationships');
   }
 
   // -------------------------------------------------------------------------
   // Scheduler
   // -------------------------------------------------------------------------
 
+  /** Scheduled tasks (`ListScheduledItems`). */
+  async listScheduledItems<T = unknown>(params: {
+    tenantFilter?: string;
+    name?: string;
+    type?: string;
+    showHidden?: boolean;
+  }): Promise<T> {
+    return this.request<T>('GET', 'ListScheduledItems', {
+      tenantFilter: params.tenantFilter,
+      Name: params.name,
+      Type: params.type,
+      ShowHidden: params.showHidden ? 'true' : undefined,
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Raw read-only access
+  // -------------------------------------------------------------------------
+
   /**
-   * List scheduled items (recurring jobs) managed by CIPP.
-   * Calls the `ListScheduledItems` Azure Function.
-   *
-   * @param params - Optional filter / paging parameters passed as the POST body.
+   * Arbitrary Microsoft Graph GET via CIPP (`ListGraphRequest`). Always sends
+   * `NoPagination=true` because CIPP otherwise follows every `@odata.nextLink`
+   * and `$top` alone would not bound the result.
    */
-  async listScheduledItems<T = unknown>(params?: Record<string, unknown>): Promise<T> {
-    return this.request<T>('POST', 'ListScheduledItems', undefined, params ?? {});
+  async graphRequest<T = unknown>(
+    tenantFilter: string,
+    params: {
+      endpoint: string;
+      select?: string;
+      filter?: string;
+      search?: string;
+      orderby?: string;
+      expand?: string;
+      top?: number;
+      countOnly?: boolean;
+      version?: string;
+    }
+  ): Promise<T> {
+    const top = Math.min(Math.max(params.top ?? 50, 1), 999);
+    return this.request<T>('GET', 'ListGraphRequest', {
+      tenantFilter,
+      Endpoint: params.endpoint.replace(/^\/+/, ''),
+      $select: params.select,
+      $filter: params.filter,
+      $search: params.search,
+      $orderby: params.orderby,
+      $expand: params.expand,
+      $top: params.countOnly ? undefined : top,
+      $count: params.search || params.countOnly ? 'true' : undefined,
+      CountOnly: params.countOnly ? 'true' : undefined,
+      NoPagination: 'true',
+      Version: params.version,
+    });
   }
 
   /**
-   * Add a new scheduled item (recurring job) to CIPP.
-   * Calls the `AddScheduledItem` Azure Function.
-   *
-   * @param itemData - Scheduled item properties (name, recurrence, taskInfo, etc.).
+   * Read-only Exchange Online cmdlet via CIPP (`ListExoRequest`). Only
+   * `Get-*` / `Search-*` cmdlets are accepted; CIPP enforces the same rule
+   * server-side.
    */
-  async addScheduledItem<T = unknown>(itemData: Record<string, unknown>): Promise<T> {
-    return this.request<T>('POST', 'AddScheduledItem', undefined, itemData);
+  async exoRequest<T = unknown>(
+    tenantFilter: string,
+    cmdlet: string,
+    cmdParams: Record<string, unknown> | undefined,
+    select: string
+  ): Promise<T> {
+    if (!EXO_READ_ONLY_CMDLET.test(cmdlet)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `cmdlet "${cmdlet}" is not allowed: only Get-* and Search-* Exchange cmdlets can be run through this read-only tool.`
+      );
+    }
+    return this.request<T>('POST', 'ListExoRequest', undefined, {
+      TenantFilter: tenantFilter,
+      Cmdlet: cmdlet,
+      cmdParams: cmdParams ?? {},
+      Select: select,
+    });
   }
 }

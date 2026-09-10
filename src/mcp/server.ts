@@ -75,25 +75,17 @@ export class CippMcpServer {
    */
   private getServerInstructions(): string {
     return `
-CIPP MCP Server — M365 multi-tenant management platform for MSPs.
+CIPP MCP Server — READ-ONLY access to CIPP (CyberDrain Improved Partner Portal), the M365 multi-tenant management platform for MSPs. No tool here changes anything.
 
-Use tenantFilter to scope operations to a specific tenant domain (e.g. "contoso.com").
-Most listing tools accept 'allTenants' as tenantFilter to query across every managed tenant.
+How to work efficiently:
+- Resolve the customer first: cipp_list_tenants (optionally with search) gives the tenantFilter (default domain) every other tool needs.
+- Most list tools REQUIRE a filter (user, search, identity, type...) so a whole-tenant dump is never returned by accident. The error message names the accepted filters.
+- List results are CSV with a curated column set. Pass fields=[...] to choose columns (dotted paths allowed), limit=N to cap rows, format="json" only when nested data is needed.
+- Responses are capped at ~32 KB; a trailing "# ..." line tells you when rows were cut. Narrow the filter rather than raising limit.
+- 'AllTenants' as tenantFilter is only accepted by cheap cached reports (licenses, secure score, forwarding, service health, alignment/drift).
+- For anything without a dedicated tool use cipp_graph_request (Graph GET, always pass select; countOnly=true to size first) or cipp_exo_request (Get-*/Search-* Exchange cmdlets, select required).
 
-Always confirm destructive operations (disable user, offboard user, reset password) before executing.
-
-Tool categories:
-- Tenants: list and inspect managed tenants
-- Users: list, create, edit, disable, offboard, MFA/session management, BEC check
-- Groups: list and create Azure AD groups
-- Mailboxes: list mailboxes and permissions, configure OoO and forwarding
-- Security: Conditional Access policies, named locations
-- Standards: compliance standards, BPA results, domain health
-- Licenses: per-tenant and CSP-level license reporting
-- Alerts: audit logs and alert queue
-- GDAP: roles and relationship invites
-- Scheduler: list and create scheduled tasks
-- Core: ping, version, logs
+Tool groups: tenants, users (search, MFA, sign-ins, inactive, guests, roles, BEC check), groups, mailboxes (permissions, rules, forwarding, OoO, message trace), devices, security (Conditional Access, named locations, Secure Score), standards (templates, alignment, drift, domain health), licenses, alerts/logs, GDAP, scheduler, raw Graph/EXO, core.
 `.trim();
   }
 
