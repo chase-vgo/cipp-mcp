@@ -59,7 +59,7 @@ const USER_DROP_KEYS = [
 /** Keys of ListUserMailboxDetails that duplicate the summary fields in bulk. */
 const MAILBOX_DETAILS_DROP_KEYS = ['Mailbox', 'MailboxActionsData'];
 
-const GROUP_MEMBER_COLUMNS = ['displayName', 'userPrincipalName', 'mail', 'id', '@odata.type'];
+const GROUP_MEMBER_COLUMNS = ['displayName', 'userPrincipalName', 'mail', 'id'];
 
 export class CippToolHandler {
   private cippService: CippService;
@@ -312,8 +312,16 @@ export class CippToolHandler {
         const members = this.bool(a, 'members') ?? false;
         const owners = this.bool(a, 'owners') ?? false;
         let data = await svc.listGroups(tenant, { groupId, members, owners });
-        if (groupId && (members || owners)) {
-          return this.list(data, def, out, GROUP_MEMBER_COLUMNS);
+        if (groupId) {
+          // With groupID CIPP returns { groupInfo, members, owners, allowExternal, ... }.
+          const detail = (unwrapList(data) ?? [data])[0] as Record<string, unknown> | undefined;
+          if (members || owners) {
+            const key = members ? 'members' : 'owners';
+            const list = detail && Array.isArray(detail[key]) ? detail[key] : (detail?.[key] ?? []);
+            return this.list(list, def, out, GROUP_MEMBER_COLUMNS);
+          }
+          const info = detail?.groupInfo ?? detail;
+          return this.object(info, ['@odata.context']);
         }
         const search = this.str(a, 'search');
         if (search) {

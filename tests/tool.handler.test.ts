@@ -115,6 +115,25 @@ describe('CippToolHandler', () => {
     expect(text).toContain('a@c.com');
   });
 
+  it('list_groups with groupId returns the nested members list, or groupInfo without members/owners', async () => {
+    const fetchMock = mockCipp({
+      ListGroups: (u) => {
+        expect(u.searchParams.get('groupID')).toBe('g1');
+        return {
+          groupInfo: { id: 'g1', displayName: 'Sales', '@odata.context': 'x' },
+          members: [{ id: 'u1', displayName: 'Alice', userPrincipalName: 'alice@c.com', mail: 'alice@c.com', '@odata.type': '#microsoft.graph.user' }],
+          owners: [],
+          allowExternal: true,
+        };
+      },
+    });
+    const members = (await handler.handleToolCall('cipp_list_groups', { tenantFilter: 'c.com', groupId: 'g1', members: true })).content[0].text;
+    expect(members).toBe('displayName,userPrincipalName,mail,id\nAlice,alice@c.com,alice@c.com,u1');
+    expect(new URL(fetchMock.mock.calls[0][0] as string).searchParams.get('members')).toBe('true');
+    const info = (await handler.handleToolCall('cipp_list_groups', { tenantFilter: 'c.com', groupId: 'g1' })).content[0].text;
+    expect(JSON.parse(info)).toEqual({ id: 'g1', displayName: 'Sales' });
+  });
+
   it('get_tenant_alignment scopes client-side because CIPP ignores tenantFilter', async () => {
     const fetchMock = mockCipp({
       ListTenantAlignment: () => [
