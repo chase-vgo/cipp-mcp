@@ -2,7 +2,7 @@
 // filters, CSV output and the raw read-only tools.
 import { McpError } from '@modelcontextprotocol/sdk/types.js';
 import { CippService } from '../src/services/cipp.service.js';
-import { CippToolHandler } from '../src/handlers/tool.handler.js';
+import { CippToolHandler, summarizeBecResult } from '../src/handlers/tool.handler.js';
 import { Logger } from '../src/utils/logger.js';
 
 const logger = new Logger('error');
@@ -13,6 +13,13 @@ function jsonResponse(payload: unknown): Response {
 }
 
 type Route = (url: URL, init: RequestInit) => unknown;
+
+/** Find the request made to a given CIPP function (tenant resolution may call ListTenants first). */
+function callTo(fetchMock: jest.Mock, fn: string): [string, RequestInit] {
+  const call = fetchMock.mock.calls.find((c) => (c[0] as string).includes('/api/' + fn));
+  if (!call) throw new Error('no call to ' + fn);
+  return call as [string, RequestInit];
+}
 
 function mockCipp(routes: Record<string, Route>) {
   const fetchMock = jest.fn((url: string, init: RequestInit) => {
@@ -77,7 +84,7 @@ describe('CippToolHandler', () => {
       searchField: 'displayName',
       searchValue: "O'Brien",
     });
-    const url = new URL(fetchMock.mock.calls[0][0] as string);
+    const url = new URL(callTo(fetchMock, 'ListUsers')[0]);
     expect(url.searchParams.get('graphFilter')).toBe("startswith(displayName,'O''Brien')");
     const text = res.content[0].text;
     expect(text.split('\n')[0]).toBe('displayName,userPrincipalName,id,accountEnabled,assignedLicenses.length');
@@ -129,7 +136,7 @@ describe('CippToolHandler', () => {
     });
     const members = (await handler.handleToolCall('cipp_list_groups', { tenantFilter: 'c.com', groupId: 'g1', members: true })).content[0].text;
     expect(members).toBe('displayName,userPrincipalName,mail,id\nAlice,alice@c.com,alice@c.com,u1');
-    expect(new URL(fetchMock.mock.calls[0][0] as string).searchParams.get('members')).toBe('true');
+    expect(new URL(callTo(fetchMock, 'ListGroups')[0]).searchParams.get('members')).toBe('true');
     const info = (await handler.handleToolCall('cipp_list_groups', { tenantFilter: 'c.com', groupId: 'g1' })).content[0].text;
     expect(JSON.parse(info)).toEqual({ id: 'g1', displayName: 'Sales' });
   });
@@ -167,7 +174,7 @@ describe('CippToolHandler', () => {
         top: 5,
       })
     ).content[0].text;
-    const q = new URL(fetchMock.mock.calls[0][0] as string).searchParams;
+    const q = new URL(callTo(fetchMock, 'ListGraphRequest')[0]).searchParams;
     expect(q.get('Endpoint')).toBe('users');
     expect(q.get('$top')).toBe('5');
     expect(q.get('NoPagination')).toBe('true');
@@ -180,7 +187,7 @@ describe('CippToolHandler', () => {
     await expect(
       handler.handleToolCall('cipp_exo_request', { tenantFilter: 'c.com', cmdlet: 'Set-Mailbox', select: 'Identity' })
     ).rejects.toThrow(/only Get-\* and Search-\*/);
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.some((c) => (c[0] as string).includes('ListExoRequest'))).toBe(false);
 
     const text = (
       await handler.handleToolCall('cipp_exo_request', {
@@ -190,7 +197,7 @@ describe('CippToolHandler', () => {
         select: 'Identity,Alias',
       })
     ).content[0].text;
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [, init] = callTo(fetchMock, 'ListExoRequest');
     expect(init.method).toBe('POST');
     expect(JSON.parse(init.body as string)).toEqual({
       TenantFilter: 'c.com',
@@ -222,5 +229,100 @@ describe('CippToolHandler', () => {
     const last = new URL(fetchMock.mock.calls[2][0] as string).searchParams;
     expect(last.get('GUID')).toBe('guid-1');
     expect(res.content[0].text).toContain('SuspectUserMailboxRules');
+  });
+});
+
+describe('tenant resolution', () => {
+  let handler: CippToolHandler;
+  const tenants = [
+    { displayName: 'Rent Peak', defaultDomainName: 'RentPeak.onmicrosoft.com', initialDomainName: 'RentPeak.onmicrosoft.com', customerId: 'a7f38009', Excluded: false },
+    { displayName: 'Access Combustion', defaultDomainName: 'accessburner.com', initialDomainName: 'accessburner1.onmicrosoft.com', customerId: 'dc5ab786', Excluded: false },
+    { displayName: 'Acme East', defaultDomainName: 'acme-east.com', initialDomainName: 'acme.onmicrosoft.com', customerId: 'e1', Excluded: false },
+    { displayName: 'Acme Holdings', defaultDomainName: 'acme.com', initialDomainName: 'acmehold.onmicrosoft.com', customerId: 'w1', Excluded: false },
+  ];
+
+  beforeEach(() => {
+    const svc = new CippService({ cipp: { baseUrl: 'https://cipp.example', apiKey: 'k' } }, logger);
+    handler = new CippToolHandler(svc, logger);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('maps a verified domain / display name / tenant id onto the CIPP default domain and notes it', async () => {
+    const fetchMock = mockCipp({
+      ListTenants: () => tenants,
+      ListUserCounts: (u) => ({ Users: 1, tenant: u.searchParams.get('tenantFilter') }),
+    });
+    for (const input of ['rentpeak.com', 'Rent Peak', 'rentpeak', 'a7f38009']) {
+      const text = (await handler.handleToolCall('cipp_user_counts', { tenantFilter: input })).content[0].text;
+      expect(text).toContain('RentPeak.onmicrosoft.com');
+      expect(text.startsWith(`# tenantFilter "${input}" resolved to RentPeak.onmicrosoft.com`)).toBe(true);
+    }
+    // Exact default domain passes through with no note, and ListTenants is cached (called once).
+    const exact = (await handler.handleToolCall('cipp_user_counts', { tenantFilter: 'accessburner.com' })).content[0].text;
+    expect(exact.startsWith('#')).toBe(false);
+    expect(fetchMock.mock.calls.filter((c) => (c[0] as string).includes('ListTenants'))).toHaveLength(1);
+  });
+
+  it('rejects unknown and ambiguous tenants with a helpful message', async () => {
+    mockCipp({ ListTenants: () => tenants });
+    await expect(handler.handleToolCall('cipp_user_counts', { tenantFilter: 'nobody.example' })).rejects.toThrow(
+      /not a tenant CIPP knows.*cipp_list_tenants/
+    );
+    await expect(handler.handleToolCall('cipp_user_counts', { tenantFilter: 'acme.org' })).rejects.toThrow(
+      /ambiguous between: acme-east\.com, acme\.com/
+    );
+  });
+
+  it('passes the value through untouched when ListTenants is unavailable', async () => {
+    mockCipp({ ListUserCounts: () => ({ Users: 1 }) });
+    const text = (await handler.handleToolCall('cipp_user_counts', { tenantFilter: 'whatever.com' })).content[0].text;
+    expect(text).toBe('{"Users":1}');
+  });
+});
+
+describe('BEC check', () => {
+  it('summarizeBecResult keeps counts, orders foreign/failed sign-ins first and caps items', () => {
+    const signIns = Array.from({ length: 30 }, (_, i) => ({
+      CreatedDateTime: `t${i}`,
+      AppDisplayName: 'App',
+      Status: i === 7 ? 'Failed' : 'Success',
+      IPAddress: '1.1.1.1',
+      Country: i === 3 ? 'RU' : 'US',
+      City: 'X',
+      ForeignLocation: i === 3,
+      id: 'drop-me',
+    }));
+    const out = summarizeBecResult(
+      { SuspectUserSignIns: signIns, NewRules: [], LocationAnalysis: { UsageLocation: 'US' }, AnalysisWindowDays: 7 },
+      5
+    ) as Record<string, any>;
+    expect(out.SuspectUserSignIns.count).toBe(30);
+    expect(out.SuspectUserSignIns.foreignOrFailed).toBe(2);
+    expect(out.SuspectUserSignIns.shown).toBe(5);
+    expect(out.SuspectUserSignIns.items[0]).toMatchObject({ Country: 'RU', ForeignLocation: true });
+    expect(out.SuspectUserSignIns.items[1]).toMatchObject({ Status: 'Failed' });
+    expect(out.SuspectUserSignIns.items[0]).not.toHaveProperty('id');
+    expect(out.NewRules).toEqual({ count: 0, items: [] });
+    expect(out.LocationAnalysis).toEqual({ UsageLocation: 'US' });
+    expect(out.AnalysisWindowDays).toBe(7);
+  });
+
+  it('resolves a UPN to the object id, defaults userName, and returns the summary', async () => {
+    const svc = new CippService({ cipp: { baseUrl: 'https://cipp.example', apiKey: 'k' } }, logger);
+    const handler = new CippToolHandler(svc, logger);
+    const fetchMock = mockCipp({
+      ListUsers: () => [{ id: 'guid-9', userPrincipalName: 'a@c.com' }],
+      ExecBECCheck: (u) => {
+        expect(u.searchParams.get('userid')).toBe('guid-9');
+        expect(u.searchParams.get('userName')).toBe('a@c.com');
+        return { AddedApps: [{ displayName: 'X', nested: { y: 1 } }], MaliciousSPs: [] };
+      },
+    });
+    const text = (await handler.handleToolCall('cipp_bec_check', { tenantFilter: 'c.com', userId: 'a@c.com' })).content[0].text;
+    expect(JSON.parse(text)).toEqual({
+      AddedApps: { count: 1, items: [{ displayName: 'X' }] },
+      MaliciousSPs: { count: 0, items: [] },
+    });
+    expect(fetchMock.mock.calls.some((c) => (c[0] as string).includes('ListUsers'))).toBe(true);
   });
 });

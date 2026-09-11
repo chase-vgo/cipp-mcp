@@ -58,7 +58,7 @@ const READ_ONLY = {
 const TENANT_FILTER_PROP = {
   type: 'string',
   description:
-    "Tenant default domain (e.g. contoso.com) or tenant ID. Use 'AllTenants' only where the tool says it is allowed.",
+    "Tenant as known to CIPP: default domain (often <name>.onmicrosoft.com), tenant ID, or display name; other verified domains are resolved when unambiguous. Get it from cipp_list_tenants. Use 'AllTenants' only where the tool says it is allowed.",
 };
 
 const USER_ID_PROP = {
@@ -413,16 +413,21 @@ export const TOOL_DEFINITIONS: McpToolDefinition[] = [
   objectTool({
     name: 'cipp_bec_check',
     description:
-      "Business Email Compromise assessment for one user (recent sign-ins with location analysis, inbox rules and rule changes, trusted/blocked sender changes, sharing activity, new app consents, MFA methods, devices). CIPP runs this asynchronously; the tool polls up to ~60 s and returns compact JSON. If it returns Waiting=true, call again with the same arguments.",
+      "Business Email Compromise assessment for one user: sign-ins with location analysis (foreign/failed first), inbox rules and rule changes, forwarding, trusted/blocked sender changes, sharing changes, new app consents, MFA methods, devices, password changes. CIPP runs it asynchronously; the tool waits up to ~20 s. If the answer is Waiting=true, call again with the same arguments. Returns a compact summary (counts + top items per section); full=true returns everything.",
     inputSchema: {
       type: 'object',
       properties: {
         tenantFilter: TENANT_FILTER_PROP,
-        userId: { type: 'string', description: "User's Entra object ID (GUID)." },
-        userName: { type: 'string', description: "User's UPN (used for the Exchange-side checks)." },
+        userId: { type: 'string', description: "User's UPN or Entra object ID (a UPN is resolved to the object ID)." },
+        userName: {
+          type: 'string',
+          description: "User's UPN, used for the Exchange-side checks. Defaults to userId when that is a UPN.",
+        },
         overwrite: { type: 'boolean', description: 'Force a fresh run instead of returning cached results.' },
+        full: { type: 'boolean', description: 'Return the complete CIPP result instead of the summary (large, may be cut at 32 KB).' },
+        itemsPerSection: { type: 'integer', description: 'Items kept per section in the summary (default 10).' },
       },
-      required: ['tenantFilter', 'userId', 'userName'],
+      required: ['tenantFilter', 'userId'],
     },
     rules: { rejectAllTenants: ['tenantFilter'] },
   }),

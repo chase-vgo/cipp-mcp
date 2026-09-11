@@ -48,9 +48,12 @@ export interface DomainHealthCheck {
  */
 const DOMAIN_HEALTH_CHECK_TIMEOUT_MS = 15_000;
 
-/** BEC check polling: interval and overall budget. */
+/**
+ * BEC check polling: interval and per-call budget. The budget is kept well
+ * under typical MCP gateway tool timeouts; callers re-invoke to keep waiting.
+ */
 const BEC_POLL_INTERVAL_MS = 3_000;
-const BEC_POLL_BUDGET_MS = 60_000;
+const BEC_POLL_BUDGET_MS = 20_000;
 
 /** Only these Exchange verbs are accepted by the raw EXO tool. */
 const EXO_READ_ONLY_CMDLET = /^(Get|Search)-[A-Za-z0-9]+$/;
@@ -184,6 +187,12 @@ export class CippService {
         status: response.status,
         body: responseBody,
       });
+      if (/not in CIPP'?s tenant list/i.test(responseBody)) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `CIPP does not know tenant "${params?.tenantFilter ?? body?.tenantFilter ?? body?.TenantFilter ?? ''}". tenantFilter must be the tenant's CIPP default domain or tenant ID; find it with cipp_list_tenants (search).`
+        );
+      }
       throw new McpError(
         ErrorCode.InternalError,
         `CIPP API returned HTTP ${response.status} for ${method} ${url.toString()}: ${responseBody}`
@@ -372,7 +381,12 @@ export class CippService {
       });
       if (!this.becIsWaiting(latest)) return latest as T;
     }
-    return { Waiting: true, GUID: userId, note: 'Assessment still running; call again to fetch results.' } as T;
+    return {
+      Waiting: true,
+      GUID: userId,
+      note:
+        'CIPP is still running the assessment. Call cipp_bec_check again with the same arguments to fetch the result. If it is still waiting after a few attempts, retry with overwrite=true to re-queue it.',
+    } as T;
   }
 
   private becIsWaiting(payload: unknown): boolean {

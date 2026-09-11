@@ -4,7 +4,7 @@ Read-only access to CIPP (M365 multi-tenant data) for AI agents. In the Velocigo
 
 ## Rules that save tokens
 
-1. **Resolve the tenant first.** Every tenant-scoped tool needs `tenantFilter` = the tenant's default domain. Get it from `cipp___cipp_list_tenants` with `search`.
+1. **Resolve the tenant first.** Every tenant-scoped tool needs `tenantFilter` = the tenant's CIPP default domain (often `<name>.onmicrosoft.com`, not the mail domain). Get it from `cipp___cipp_list_tenants` with `search`. If you pass a display name, tenant ID or another domain of the tenant instead, the server resolves it when unambiguous and prefixes the result with `# tenantFilter "x" resolved to y`.
 2. **Filter before you list.** Tools that could return a whole tenant refuse to run without a filter and tell you which filters they accept. Never work around this by using `cipp___cipp_graph_request` without `select` and `top`.
 3. **Lists are CSV.** First line is the header. Use `fields` to pick columns (dotted paths like `location.city` or `assignedLicenses.length` work), `limit` to cap rows (default 100), `format: "json"` only when you need nested data.
 4. **Read the footer.** `# showing 25 of 310 rows ...` or `# response truncated at 32 KB ...` means narrow the query, not raise the limit. `# no rows` means an empty result.
@@ -52,13 +52,13 @@ cipp___cipp_get_user_mailbox_details  { "tenantFilter": "accessburner.com", "use
 ### Suspected compromise (BEC)
 
 ```json
-cipp___cipp_bec_check               { "tenantFilter": "accessburner.com", "userId": "873454fd-...", "userName": "abarone@accessburner.com" }
+cipp___cipp_bec_check               { "tenantFilter": "accessburner.com", "userId": "abarone@accessburner.com" }
 cipp___cipp_list_user_mailbox_rules { "tenantFilter": "accessburner.com", "userId": "abarone@accessburner.com" }
 cipp___cipp_list_signins            { "tenantFilter": "accessburner.com", "user": "abarone", "days": 7 }
 cipp___cipp_list_signins            { "tenantFilter": "accessburner.com", "failedOnly": true, "days": 3 }
 cipp___cipp_list_mailbox_forwarding { "tenantFilter": "accessburner.com", "externalOnly": true }
 ```
-`cipp___cipp_bec_check` needs the object ID in `userId` (get it from `cipp___cipp_get_user`) and polls CIPP for up to 60 s. If it returns `{"Waiting":true,...}`, call it again with the same arguments.
+`cipp___cipp_bec_check` accepts a UPN or object ID and waits up to ~20 s for CIPP's background job. If it returns `{"Waiting":true,...}`, call it again with the same arguments (add `"overwrite": true` if it stays waiting). The default output is a summary: per section a `count`, the most relevant items (foreign or failed sign-ins first) and, for sign-in sections, `foreignOrFailed`. Use `"full": true` only when every record is needed.
 
 ### Mailboxes
 

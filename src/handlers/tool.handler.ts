@@ -61,10 +61,80 @@ const MAILBOX_DETAILS_DROP_KEYS = ['Mailbox', 'MailboxActionsData'];
 
 const GROUP_MEMBER_COLUMNS = ['displayName', 'userPrincipalName', 'mail', 'id'];
 
+/** How long a resolved tenant list is reused before ListTenants is called again. */
+const TENANT_CACHE_MS = 10 * 60 * 1000;
+
+/** Fields kept per BEC section in the summary; sections not listed keep their scalar fields. */
+const BEC_SECTION_FIELDS: Record<string, string[]> = {
+  SuspectUserSignIns: ['CreatedDateTime', 'AppDisplayName', 'ClientAppUsed', 'Status', 'IPAddress', 'Country', 'City', 'ForeignLocation'],
+  LastSuspectUserLogon: ['CreatedDateTime', 'AppDisplayName', 'ClientAppUsed', 'Status', 'IPAddress', 'Country', 'City', 'ForeignLocation'],
+  TenantLastSignIns: ['CreatedDateTime', 'userPrincipalName', 'AppDisplayName', 'Status', 'IPAddress', 'Country', 'City'],
+  SuspectUserDevices: ['DeviceFriendlyName', 'DeviceModel', 'DeviceOS', 'DeviceType', 'ClientType', 'DeviceAccessState', 'FirstSyncTime', 'LastSuccessSync'],
+  IntuneDevices: ['deviceName', 'operatingSystem', 'osVersion', 'complianceState', 'lastSyncDateTime', 'enrolledDateTime'],
+  AddedApps: ['displayName', 'createdDateTime', 'appId', 'MaliciousMatch'],
+  MaliciousSPs: ['displayName', 'appId', 'Name', 'Categories', 'Description'],
+  NewRules: ['Name', 'Enabled', 'Description', 'From', 'ForwardTo', 'ForwardAsAttachmentTo', 'RedirectTo', 'DeleteMessage', 'MoveToFolder'],
+  MFADevices: ['@odata.type', 'displayName', 'createdDateTime', 'phoneNumber', 'emailAddress', 'deviceTag'],
+};
+
+/** Sections where the tenant-wide noise is high; keep fewer items. */
+const BEC_SECTION_LIMITS: Record<string, number> = { TenantLastSignIns: 5 };
+
+function becInteresting(item: unknown): number {
+  const foreign = getPath(item, 'ForeignLocation') === true;
+  const failed = cellValue(getPath(item, 'Status')).toLowerCase() === 'failed';
+  return (foreign ? 2 : 0) + (failed ? 1 : 0);
+}
+
+/**
+ * Reduce a CIPP BEC result to counts plus the most relevant items per section
+ * so it fits comfortably in context. Sign-in sections are ordered foreign /
+ * failed first; nested objects are dropped unless a section lists them.
+ */
+export function summarizeBecResult(result: unknown, itemsPerSection = 10): unknown {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(result as Record<string, unknown>)) {
+    if (!Array.isArray(value)) {
+      out[key] = value;
+      continue;
+    }
+    const limit = BEC_SECTION_LIMITS[key] ?? itemsPerSection;
+    const fields = BEC_SECTION_FIELDS[key];
+    const ordered = [...value].sort((a, b) => becInteresting(b) - becInteresting(a));
+    const items = ordered.slice(0, limit).map((item) => {
+      if (!item || typeof item !== 'object') return item;
+      const rec = item as Record<string, unknown>;
+      if (fields) {
+        const proj: Record<string, unknown> = {};
+        for (const f of fields) {
+          const v = getPath(rec, f);
+          if (v !== undefined && v !== null && v !== '') proj[f] = v;
+        }
+        return proj;
+      }
+      const scalars: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(rec)) {
+        if (v !== null && v !== '' && typeof v !== 'object') scalars[k] = v;
+      }
+      return scalars;
+    });
+    const flagged = value.filter((v) => becInteresting(v) > 0).length;
+    out[key] = {
+      count: value.length,
+      ...(fields && key.toLowerCase().includes('signin') ? { foreignOrFailed: flagged } : {}),
+      ...(value.length > items.length ? { shown: items.length } : {}),
+      items,
+    };
+  }
+  return out;
+}
+
 export class CippToolHandler {
   private cippService: CippService;
   private logger: Logger;
   private mcpServer: Server | null = null;
+  private tenantCache: { at: number; rows: Record<string, unknown>[] } | undefined;
 
   constructor(cippService: CippService, logger: Logger) {
     this.cippService = cippService;
@@ -100,8 +170,16 @@ export class CippToolHandler {
     };
 
     try {
+      let note = '';
+      if (typeof args.tenantFilter === 'string' && def.name !== 'cipp_list_tenants') {
+        const resolved = await this.resolveTenant(args.tenantFilter);
+        if (resolved !== args.tenantFilter) {
+          note = `# tenantFilter "${args.tenantFilter}" resolved to ${resolved}\n`;
+          args.tenantFilter = resolved;
+        }
+      }
       const text = await this.dispatch(def, args, out);
-      return { content: [{ type: 'text', text }] };
+      return { content: [{ type: 'text', text: note + text }] };
     } catch (error) {
       if (error instanceof McpError) {
         throw error;
@@ -137,6 +215,71 @@ export class CippToolHandler {
   private num(args: Args, key: string): number | undefined {
     const v = args[key];
     return typeof v === 'number' ? v : undefined;
+  }
+
+  /**
+   * Cached CIPP tenant rows for {@link resolveTenant}. Failures return an
+   * empty list so tenant resolution degrades to pass-through.
+   */
+  private async tenantRows(): Promise<Record<string, unknown>[]> {
+    const now = Date.now();
+    if (this.tenantCache && now - this.tenantCache.at < TENANT_CACHE_MS) return this.tenantCache.rows;
+    try {
+      const data = await this.cippService.listTenants();
+      const rows = (unwrapList(data) ?? []).filter(
+        (r): r is Record<string, unknown> => !!r && typeof r === 'object'
+      );
+      this.tenantCache = { at: now, rows };
+      return rows;
+    } catch (err) {
+      this.logger.warn('Tenant resolution skipped: ListTenants failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return [];
+    }
+  }
+
+  /**
+   * Map whatever the caller passed as tenantFilter onto the value CIPP
+   * accepts (the tenant's default domain). Exact matches on default domain,
+   * tenant ID or initial domain pass through; otherwise the display name or
+   * the first DNS label (so "rentpeak.com" finds "RentPeak.onmicrosoft.com")
+   * is tried and must be unambiguous.
+   */
+  private async resolveTenant(tenantFilter: string): Promise<string> {
+    const lc = tenantFilter.trim().toLowerCase();
+    if (!lc || lc === 'alltenants') return tenantFilter;
+    const rows = await this.tenantRows();
+    if (rows.length === 0) return tenantFilter;
+
+    const val = (r: unknown, k: string) => cellValue(getPath(r, k)).toLowerCase();
+    const exact = rows.find((r) =>
+      ['defaultDomainName', 'customerId', 'initialDomainName'].some((k) => val(r, k) === lc)
+    );
+    if (exact) return cellValue(getPath(exact, 'defaultDomainName')) || tenantFilter;
+
+    const label = lc.split('@').pop()!.split('.')[0];
+    const compact = lc.replace(/[^a-z0-9]/g, '');
+    const fuzzy = rows.filter((r) => {
+      const name = val(r, 'displayName');
+      return (
+        name === lc ||
+        name.replace(/[^a-z0-9]/g, '') === compact ||
+        val(r, 'defaultDomainName').split('.')[0] === label ||
+        val(r, 'initialDomainName').split('.')[0] === label ||
+        val(r, 'domains').split(/[,;\s]+/).includes(lc)
+      );
+    });
+    if (fuzzy.length === 1) return cellValue(getPath(fuzzy[0], 'defaultDomainName')) || tenantFilter;
+
+    const hint =
+      fuzzy.length > 1
+        ? ` It is ambiguous between: ${fuzzy.map((r) => cellValue(getPath(r, 'defaultDomainName'))).join(', ')}.`
+        : '';
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `tenantFilter "${tenantFilter}" is not a tenant CIPP knows.${hint} Use cipp_list_tenants with search to find the default domain.`
+    );
   }
 
   /**
@@ -296,15 +439,17 @@ export class CippToolHandler {
           out
         );
 
-      case 'cipp_bec_check':
-        return this.object(
-          await svc.becCheck(
-            tenant,
-            this.str(a, 'userId') as string,
-            this.str(a, 'userName') as string,
-            this.bool(a, 'overwrite') ?? false
-          )
-        );
+      case 'cipp_bec_check': {
+        const rawUser = this.str(a, 'userId') as string;
+        const userName = this.str(a, 'userName') ?? (rawUser.includes('@') ? rawUser : undefined);
+        if (!userName) {
+          throw new McpError(ErrorCode.InvalidParams, 'cipp_bec_check: userName (the UPN) is required when userId is an object ID.');
+        }
+        const objectId = await this.resolveUserObjectId(tenant, rawUser);
+        const result = await svc.becCheck(tenant, objectId, userName, this.bool(a, 'overwrite') ?? false);
+        if (this.bool(a, 'full')) return this.object(result);
+        return this.object(summarizeBecResult(result, this.num(a, 'itemsPerSection') ?? 10));
+      }
 
       // ------------------------------------------------------------------ Groups
       case 'cipp_list_groups': {
